@@ -108,10 +108,13 @@ function hashToken(token) {
 // (prunes expired) refresh tokens on the user document as it goes.
 async function issueSession(user) {
   const token = crypto.randomBytes(40).toString("hex");
-  const freshTokens = [
-    ...(user.refreshTokens || []).filter((t) => t.expiresAt > Date.now()),
-    { tokenHash: hashToken(token), expiresAt: Date.now() + REFRESH_TOKEN_TTL_MS },
-  ];
+  const newEntry = { tokenHash: hashToken(token), expiresAt: Date.now() + REFRESH_TOKEN_TTL_MS };
+  // Buyers get exactly one active session — logging in elsewhere (or on
+  // another device) signs them out everywhere else. Sellers/advertisers/admin
+  // keep normal multi-device support.
+  const freshTokens = user.role === "buyer"
+    ? [newEntry]
+    : [...(user.refreshTokens || []).filter((t) => t.expiresAt > Date.now()), newEntry];
   await db.users.updateOne({ id: user.id }, { $set: { refreshTokens: freshTokens } });
   return { token: signAccessToken(user), refreshToken: token };
 }
@@ -344,6 +347,61 @@ app.get("/api/auth/me", auth, async (req, res) => {
   res.json({ user: publicUser(user) });
 });
 
+// Change your own email and/or password (any logged-in role — surfaced in
+// the UI for admin first, since that account has no email-recovery flow
+// worth relying on for itself).
+app.post("/api/auth/update-account", auth, authLimiter, async (req, res) => {
+  const { currentPassword, newEmail, newPassword } = req.body || {};
+  if (!currentPassword) return res.status(400).json({ error: "Enter your current password to confirm this change." });
+  const user = await db.users.findOne({ id: req.user.sub });
+  if (!user) return res.status(404).json({ error: "Account not found." });
+
+  const ok = await bcrypt.compare(currentPassword, user.passwordHash);
+  if (!ok) return res.status(401).json({ error: "Current password is incorrect." });
+
+  const update = {};
+  if (newEmail && newEmail.trim().toLowerCase() !== user.email) {
+    const email = newEmail.trim().toLowerCase();
+    const taken = await db.users.findOne({ email, id: { $ne: user.id } });
+    if (taken) return res.status(409).json({ error: "That email is already in use by another account." });
+    update.email = email;
+  }
+  if (newPassword) {
+    if (newPassword.length < 8) return res.status(400).json({ error: "New password must be at least 8 characters." });
+    update.passwordHash = await bcrypt.hash(newPassword, 10);
+    update.refreshTokens = []; // log out everywhere else on password change
+  }
+  if (Object.keys(update).length === 0) return res.status(400).json({ error: "Nothing to update." });
+
+  await db.users.updateOne({ id: user.id }, { $set: update });
+  const fresh = await db.users.findOne({ id: user.id });
+  const session = await issueSession(fresh);
+  res.json({ ...session, user: publicUser(fresh) });
+});
+
+/* ------------------------------------------------------------------ */
+/* Settings — persisted, admin-controlled platform config              */
+/* ------------------------------------------------------------------ */
+const DEFAULT_SELLER_SHARE = 70;
+
+async function getSellerSharePercent() {
+  const doc = await db.meta.findOne({ _id: "settings" });
+  return doc?.sellerSharePercent ?? DEFAULT_SELLER_SHARE;
+}
+
+app.get("/api/settings", async (req, res) => {
+  res.json({ sellerSharePercent: await getSellerSharePercent() });
+});
+
+app.put("/api/admin/settings", auth, requireRole("admin"), async (req, res) => {
+  const pct = Number(req.body?.sellerSharePercent);
+  if (!Number.isFinite(pct) || pct < 10 || pct > 95) {
+    return res.status(400).json({ error: "sellerSharePercent must be a number between 10 and 95." });
+  }
+  await db.meta.updateOne({ _id: "settings" }, { $set: { sellerSharePercent: pct } }, { upsert: true });
+  res.json({ sellerSharePercent: pct });
+});
+
 /* ------------------------------------------------------------------ */
 /* Categories                                                          */
 /* ------------------------------------------------------------------ */
@@ -553,6 +611,15 @@ app.post("/api/checkout/create-order", auth, authLimiter, async (req, res) => {
     return res.status(400).json({ error: "Invalid checkout kind." });
   }
 
+  // Free items (price 0, or a reward discount that brings it to 0) never touch
+  // Razorpay at all — Razorpay doesn't support zero-amount orders anyway, and
+  // there's nothing to pay for.
+  if (amount <= 0) {
+    const pending = { kind, itemId: itemId || null, adDraft: adDraft || null, rewardId, amount: 0 };
+    const result = await completeCheckout(pending, req.user.email, null);
+    return res.json({ free: true, success: true, ...result });
+  }
+
   try {
     const order = await razorpay.orders.create({
       amount: Math.round(amount * 100), // paise
@@ -573,6 +640,55 @@ app.post("/api/checkout/create-order", auth, authLimiter, async (req, res) => {
   }
 });
 
+async function completeCheckout(pending, buyerEmail, paymentId) {
+  let result;
+  if (pending.kind === "ad") {
+    const advertiser = await db.users.findOne({ email: buyerEmail });
+    const ad = {
+      id: "ad_" + Date.now(), advertiserEmail: buyerEmail, advertiserName: sellerDisplayName(advertiser),
+      headline: pending.adDraft.headline, body: pending.adDraft.body, placement: pending.adDraft.placement,
+      days: Number(pending.adDraft.days), cost: pending.amount,
+      startTs: Date.now(), endTs: Date.now() + Number(pending.adDraft.days) * 86400000,
+    };
+    await db.ads.insertOne(ad);
+    result = { ad };
+  } else {
+    const priorTestPurchases = await db.purchases.countDocuments({ buyerEmail });
+    const priorBundlePurchases = await db.bundlePurchases.countDocuments({ buyerEmail });
+    const isFirstPurchase = priorTestPurchases === 0 && priorBundlePurchases === 0;
+
+    if (pending.kind === "bundle") {
+      const purchase = {
+        id: "bp_" + Date.now(), bundleId: pending.itemId, buyerEmail,
+        price: pending.amount, paymentId: paymentId || null, ts: Date.now(),
+      };
+      await db.bundlePurchases.insertOne(purchase);
+      result = { purchase };
+    } else {
+      const purchase = {
+        id: "p_" + Date.now(), testId: pending.itemId, buyerEmail,
+        price: pending.amount, paymentId: paymentId || null, ts: Date.now(),
+      };
+      await db.purchases.insertOne(purchase);
+      result = { purchase };
+    }
+
+    const buyer = await db.users.findOne({ email: buyerEmail });
+    if (pending.rewardId) {
+      const updatedRewards = (buyer.referralRewards || []).map((r) => (r.id === pending.rewardId ? { ...r, used: true } : r));
+      await db.users.updateOne({ id: buyer.id }, { $set: { referralRewards: updatedRewards } });
+    }
+    if (isFirstPurchase && buyer.referredBy && !buyer.referralBonusGranted) {
+      await db.users.updateOne({ id: buyer.id }, { $set: { referralBonusGranted: true } });
+      await db.users.updateOne(
+        { email: buyer.referredBy },
+        { $push: { referralRewards: { id: "rw_" + Date.now(), ts: Date.now(), used: false, fromBuyerName: buyer.name } } }
+      );
+    }
+  }
+  return result;
+}
+
 app.post("/api/checkout/verify", auth, async (req, res) => {
   const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {};
   if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
@@ -591,53 +707,7 @@ app.post("/api/checkout/verify", auth, async (req, res) => {
   if (!pending) return res.status(404).json({ error: "No matching pending order found for this account." });
   await db.pendingOrders.deleteOne({ orderId: razorpay_order_id });
 
-  let result;
-
-  if (pending.kind === "ad") {
-    const advertiser = await db.users.findOne({ email: req.user.email });
-    const ad = {
-      id: "ad_" + Date.now(), advertiserEmail: req.user.email, advertiserName: sellerDisplayName(advertiser),
-      headline: pending.adDraft.headline, body: pending.adDraft.body, placement: pending.adDraft.placement,
-      days: Number(pending.adDraft.days), cost: pending.amount,
-      startTs: Date.now(), endTs: Date.now() + Number(pending.adDraft.days) * 86400000,
-    };
-    await db.ads.insertOne(ad);
-    result = { ad };
-  } else {
-    const priorTestPurchases = await db.purchases.countDocuments({ buyerEmail: req.user.email });
-    const priorBundlePurchases = await db.bundlePurchases.countDocuments({ buyerEmail: req.user.email });
-    const isFirstPurchase = priorTestPurchases === 0 && priorBundlePurchases === 0;
-
-    if (pending.kind === "bundle") {
-      const purchase = {
-        id: "bp_" + Date.now(), bundleId: pending.itemId, buyerEmail: req.user.email,
-        price: pending.amount, paymentId: razorpay_payment_id, ts: Date.now(),
-      };
-      await db.bundlePurchases.insertOne(purchase);
-      result = { purchase };
-    } else {
-      const purchase = {
-        id: "p_" + Date.now(), testId: pending.itemId, buyerEmail: req.user.email,
-        price: pending.amount, paymentId: razorpay_payment_id, ts: Date.now(),
-      };
-      await db.purchases.insertOne(purchase);
-      result = { purchase };
-    }
-
-    const buyer = await db.users.findOne({ email: req.user.email });
-    if (pending.rewardId) {
-      const updatedRewards = (buyer.referralRewards || []).map((r) => (r.id === pending.rewardId ? { ...r, used: true } : r));
-      await db.users.updateOne({ id: buyer.id }, { $set: { referralRewards: updatedRewards } });
-    }
-    if (isFirstPurchase && buyer.referredBy && !buyer.referralBonusGranted) {
-      await db.users.updateOne({ id: buyer.id }, { $set: { referralBonusGranted: true } });
-      await db.users.updateOne(
-        { email: buyer.referredBy },
-        { $push: { referralRewards: { id: "rw_" + Date.now(), ts: Date.now(), used: false, fromBuyerName: buyer.name } } }
-      );
-    }
-  }
-
+  const result = await completeCheckout(pending, req.user.email, razorpay_payment_id);
   res.json({ success: true, ...result });
 });
 
@@ -684,15 +754,25 @@ app.get("/api/attempts/mine", auth, requireRole("buyer"), async (req, res) => {
 /* Seller payouts                                                       */
 /* ------------------------------------------------------------------ */
 app.post("/api/payouts/bank", auth, requireRole("seller"), async (req, res) => {
-  const { accName, accountNumber, ifsc, bankName } = req.body || {};
-  if (!accName?.trim() || !accountNumber?.trim() || !ifsc?.trim() || !bankName?.trim()) {
-    return res.status(400).json({ error: "All bank fields are required." });
+  const { accName, accountNumber, ifsc, bankName, upiId } = req.body || {};
+  const hasBank = accountNumber?.trim() && ifsc?.trim() && bankName?.trim();
+  const hasUpi = upiId?.trim();
+  if (!accName?.trim() || (!hasBank && !hasUpi)) {
+    return res.status(400).json({ error: "Enter your name, plus either full bank details or a UPI ID." });
+  }
+  // Loose but real validation — VPA-style id like name@bank.
+  if (hasUpi && !/^[\w.+-]{2,}@[a-zA-Z]{2,}$/.test(upiId.trim())) {
+    return res.status(400).json({ error: "That doesn't look like a valid UPI ID (e.g. yourname@upi)." });
   }
 
-  const bankDetails = { accName: accName.trim(), last4: accountNumber.slice(-4), ifsc: ifsc.trim().toUpperCase(), bankName: bankName.trim() };
+  const bankDetails = {
+    accName: accName.trim(),
+    ...(hasBank ? { last4: accountNumber.slice(-4), ifsc: ifsc.trim().toUpperCase(), bankName: bankName.trim() } : {}),
+    ...(hasUpi ? { upiId: upiId.trim().toLowerCase() } : {}),
+  };
   const update = { bankDetails };
 
-  if (RAZORPAYX_ENABLED) {
+  if (RAZORPAYX_ENABLED && hasBank) {
     try {
       // Reuse an existing Contact for this seller if we've already made one,
       // rather than creating a new one every time they update their bank details.
@@ -717,6 +797,10 @@ app.post("/api/payouts/bank", auth, requireRole("seller"), async (req, res) => {
       // seller's input — but flag that real payouts aren't wired up for them yet.
       update.payoutsReady = false;
     }
+  } else {
+    // UPI-only sellers (or RazorpayX not configured) always go through manual
+    // admin review — there's no automated UPI payout path here.
+    update.payoutsReady = false;
   }
 
   await db.users.updateOne({ email: req.user.email }, { $set: update });
@@ -751,7 +835,7 @@ app.post("/api/payouts/withdraw", auth, requireRole("seller"), async (req, res) 
   const user = await db.users.findOne({ email: req.user.email });
   if (!user.bankDetails) return res.status(400).json({ error: "Add your bank details first." });
 
-  const sellerShare = req.body?.sellerShare ?? 70;
+  const sellerShare = await getSellerSharePercent();
   const gross = await sellerGrossEarnings(req.user.email);
   const earn = Math.round(gross * (sellerShare / 100));
   const history = await db.payouts.find({ sellerEmail: req.user.email }).toArray();
