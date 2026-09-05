@@ -156,11 +156,19 @@ function generateReferralCode(name) {
 const AD_COST_HOMEPAGE = 500;
 const AD_COST_CATEGORY = 200;
 
-// Real email sending via SMTP (works with Hostinger's own email hosting,
-// Gmail, SendGrid, Resend's SMTP relay, or any other SMTP provider — set
-// SMTP_HOST/PORT/USER/PASS/FROM in .env). If SMTP isn't configured, this
-// falls back to printing the link to the console, so local dev still works
-// without needing real email credentials.
+// Real email sending. Two options, tried in this order:
+//
+// 1. RESEND_API_KEY — sends via Resend's HTTPS API (https://resend.com, free
+//    tier available). Recommended for Railway and similar hosts: many cloud
+//    platforms block outbound SMTP ports (25/465/587) to prevent spam abuse,
+//    which makes direct SMTP time out even when the credentials are correct.
+//    An HTTP API call goes over normal HTTPS (443), which is never blocked.
+//
+// 2. SMTP_HOST/PORT/USER/PASS/FROM — works great for local development and
+//    for hosts that do allow outbound SMTP (this includes plain VPS hosting).
+//
+// If neither is configured, this falls back to printing the link to the
+// console, so local dev still works without needing real email credentials.
 let mailer = null;
 if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
   mailer = nodemailer.createTransport({
@@ -169,10 +177,14 @@ if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
     secure: process.env.SMTP_SECURE === "true", // true for port 465, false for 587/25
     auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
   });
-  console.log(`Email sending configured via SMTP host ${process.env.SMTP_HOST}`);
-} else {
-  console.log("No SMTP settings found — emails will print to this console instead of sending. See .env.example.");
 }
+
+const emailMode = process.env.RESEND_API_KEY ? "resend" : mailer ? "smtp" : "none";
+console.log(
+  emailMode === "resend" ? "Email sending configured via Resend API." :
+  emailMode === "smtp" ? `Email sending configured via SMTP host ${process.env.SMTP_HOST}` :
+  "No email provider configured — emails will print to this console instead of sending. See .env.example."
+);
 
 async function sendEmail(to, subject, link, actionLabel) {
   const html = `
@@ -184,13 +196,22 @@ async function sendEmail(to, subject, link, actionLabel) {
       <p style="font-size: 12px; color: #79705C;">If you didn't request this, you can safely ignore this email.</p>
     </div>`;
 
-  if (!mailer) {
-    console.log(`\n--- email not sent (SMTP not configured) ---\nTo: ${to}\nSubject: ${subject}\nLink: ${link}\n---------------------------------------------\n`);
+  if (emailMode === "none") {
+    console.log(`\n--- email not sent (no provider configured) ---\nTo: ${to}\nSubject: ${subject}\nLink: ${link}\n------------------------------------------------\n`);
     return;
   }
 
   try {
-    await mailer.sendMail({ from: process.env.SMTP_FROM || process.env.SMTP_USER, to, subject, html });
+    if (emailMode === "resend") {
+      const res = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ from: process.env.RESEND_FROM || "TestMandi <onboarding@resend.dev>", to, subject, html }),
+      });
+      if (!res.ok) throw new Error(`Resend API responded ${res.status}: ${await res.text()}`);
+    } else {
+      await mailer.sendMail({ from: process.env.SMTP_FROM || process.env.SMTP_USER, to, subject, html });
+    }
   } catch (err) {
     // Never let an email failure break registration/reset itself — log it
     // and let the request succeed; the user can use "resend" if needed.
@@ -304,15 +325,17 @@ app.post("/api/auth/resend-verification", auth, async (req, res) => {
   await db.users.updateOne({ id: user.id }, { $set: { verificationTokenHash: hashToken(verificationToken) } });
 
   await sendEmail(user.email, "Verify your TestMandi account", `${PUBLIC_APP_URL}/?verify=${verificationToken}&uid=${user.id}`, "Verify email");
-  res.json({ ok: true });
+  res.json({ ok: true, emailConfigured: emailMode !== "none" });
 });
 
 app.post("/api/auth/forgot-password", authLimiter, async (req, res) => {
   const normalizedEmail = (req.body?.email || "").trim().toLowerCase();
   const user = await db.users.findOne({ email: normalizedEmail });
   // Always respond the same way whether or not the account exists, so this
-  // endpoint can't be used to check which emails are registered.
-  const genericResponse = { ok: true, message: "If that email is registered, a reset link has been sent." };
+  // endpoint can't be used to check which emails are registered. Whether
+  // SMTP is configured at all is server-wide, not per-user, so it's safe to
+  // include — it just lets the frontend show an accurate message.
+  const genericResponse = { ok: true, message: "If that email is registered, a reset link has been sent.", emailConfigured: emailMode !== "none" };
   if (!user) return res.json(genericResponse);
 
   const resetToken = crypto.randomBytes(24).toString("hex");
