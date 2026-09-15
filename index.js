@@ -28,7 +28,7 @@ app.use(cors({
     callback(new Error("Not allowed by CORS"));
   },
 }));
-app.use(express.json({ limit: "2mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
+app.use(express.json({ limit: "8mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
 
 // Global limiter — generous, just stops runaway scripts.
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 600, standardHeaders: true, legacyHeaders: false }));
@@ -777,21 +777,38 @@ app.get("/api/attempts/mine", auth, requireRole("buyer"), async (req, res) => {
 /* Seller payouts                                                       */
 /* ------------------------------------------------------------------ */
 app.post("/api/payouts/bank", auth, requireRole("seller"), async (req, res) => {
-  const { accName, accountNumber, ifsc, bankName, upiId } = req.body || {};
+  const { accName, accountNumber, ifsc, bankName, upiId, upiQrImage } = req.body || {};
   const hasBank = accountNumber?.trim() && ifsc?.trim() && bankName?.trim();
   const hasUpi = upiId?.trim();
-  if (!accName?.trim() || (!hasBank && !hasUpi)) {
-    return res.status(400).json({ error: "Enter your name, plus either full bank details or a UPI ID." });
+  const hasQrImage = upiQrImage?.trim();
+  if (!accName?.trim() || (!hasBank && !hasUpi && !hasQrImage)) {
+    return res.status(400).json({ error: "Enter your name, plus a UPI ID, a UPI QR code image, or full bank details." });
   }
   // Loose but real validation — VPA-style id like name@bank.
   if (hasUpi && !/^[\w.+-]{2,}@[a-zA-Z]{2,}$/.test(upiId.trim())) {
     return res.status(400).json({ error: "That doesn't look like a valid UPI ID (e.g. yourname@upi)." });
   }
+  if (hasQrImage && !/^data:image\/(png|jpe?g|webp);base64,/.test(upiQrImage.trim())) {
+    return res.status(400).json({ error: "QR code must be a PNG, JPG, or WEBP image." });
+  }
+  // A rough cap so nobody accidentally stores a multi-megabyte image — a
+  // scannable QR code is only ever a few tens of KB.
+  if (hasQrImage && upiQrImage.length > 1_500_000) {
+    return res.status(400).json({ error: "That image is too large — please use a smaller QR code image (under ~1MB)." });
+  }
 
   const bankDetails = {
     accName: accName.trim(),
-    ...(hasBank ? { last4: accountNumber.slice(-4), ifsc: ifsc.trim().toUpperCase(), bankName: bankName.trim() } : {}),
+    ...(hasBank ? {
+      // Full number is kept so admin can actually complete a manual bank
+      // transfer — it's only ever shown to admins, never to other sellers or
+      // buyers, and the frontend still masks it everywhere except the
+      // admin's pending-payouts view.
+      accountNumber: accountNumber.replace(/\s+/g, ""),
+      last4: accountNumber.slice(-4), ifsc: ifsc.trim().toUpperCase(), bankName: bankName.trim(),
+    } : {}),
     ...(hasUpi ? { upiId: upiId.trim().toLowerCase() } : {}),
+    ...(hasQrImage ? { upiQrImage: upiQrImage.trim() } : {}),
   };
   const update = { bankDetails };
 
@@ -1053,6 +1070,124 @@ Answer briefly (2-5 sentences, plain language, no markdown headers). Don't inven
     res.json({ reply: reply || "Sorry, I couldn't find an answer to that — try rephrasing?" });
   } catch (err) {
     res.status(502).json({ error: "Couldn't reach the chatbot right now.", detail: err.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* Seller AI tools — generate questions from a topic, or extract them   */
+/* from a scanned/photographed question paper image                    */
+/* ------------------------------------------------------------------ */
+const QUESTION_JSON_INSTRUCTIONS = `Return ONLY a JSON array, nothing else — no markdown fences, no preamble, no
+explanation text before or after. Each element must have exactly this shape:
+{"text": "question text", "options": ["opt A", "opt B", "opt C", "opt D"], "correct": 0, "topic": "short topic tag", "explanation": "why this answer is correct"}
+"correct" is the 0-based index into "options" of the right answer. Always produce exactly 4 options per question.
+If you cannot confidently produce any valid questions, return an empty array: []`;
+
+function parseQuestionsJSON(text) {
+  // Models occasionally wrap JSON in markdown fences despite instructions —
+  // strip those defensively before parsing.
+  const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
+  const parsed = JSON.parse(cleaned);
+  if (!Array.isArray(parsed)) throw new Error("Model did not return an array.");
+  return parsed
+    .filter((q) => q && typeof q.text === "string" && Array.isArray(q.options) && q.options.length === 4 && typeof q.correct === "number")
+    .map((q) => ({
+      text: q.text.trim(),
+      options: q.options.map((o) => String(o).trim()),
+      correct: Math.max(0, Math.min(3, Math.round(q.correct))),
+      topic: (q.topic || "").trim() || "General",
+      explanation: (q.explanation || "").trim(),
+    }));
+}
+
+app.post("/api/seller/generate-questions", auth, requireRole("seller"), chatLimiter, async (req, res) => {
+  if (!process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY.includes("your-key-here")) {
+    return res.status(503).json({ error: "AI question generation isn't configured yet — add ANTHROPIC_API_KEY to .env." });
+  }
+  const { topic, count, category, difficulty } = req.body || {};
+  if (!topic?.trim()) return res.status(400).json({ error: "Enter a topic to generate questions about." });
+  const n = Math.max(1, Math.min(30, Number(count) || 10)); // capped per request to keep responses fast and reliable
+
+  const system = `You are helping a teacher write multiple-choice questions for an exam-prep test on the platform
+TestMandi. Generate exactly ${n} original, factually accurate MCQ questions on the topic: "${topic.trim()}"
+${category ? `(for the exam category: ${category})` : ""}${difficulty ? ` at ${difficulty} difficulty` : ""}.
+Vary the questions across sub-topics within the subject rather than repeating the same idea. ${QUESTION_JSON_INSTRUCTIONS}`;
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 4000,
+        system,
+        messages: [{ role: "user", content: `Generate the ${n} questions now, as the JSON array only.` }],
+      }),
+    });
+    const data = await response.json();
+    const text = (data.content || []).filter((c) => c.type === "text").map((c) => c.text).join("\n").trim();
+    const questions = parseQuestionsJSON(text);
+    if (questions.length === 0) return res.status(502).json({ error: "The AI didn't return any usable questions — try a more specific topic." });
+    res.json({ questions });
+  } catch (err) {
+    console.error("AI question generation failed:", err.message);
+    res.status(502).json({ error: "Couldn't generate questions right now — please try again.", detail: err.message });
+  }
+});
+
+app.post("/api/seller/scan-questions", auth, requireRole("seller"), chatLimiter, async (req, res) => {
+  if (!process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY.includes("your-key-here")) {
+    return res.status(503).json({ error: "Question scanning isn't configured yet — add ANTHROPIC_API_KEY to .env." });
+  }
+  const { imageBase64 } = req.body || {};
+  if (!imageBase64?.trim()) return res.status(400).json({ error: "No image provided." });
+
+  const match = imageBase64.match(/^data:image\/(png|jpe?g|webp);base64,(.+)$/);
+  if (!match) return res.status(400).json({ error: "Image must be a PNG, JPG, or WEBP file." });
+  const [, ext, base64Data] = match;
+  const mediaType = `image/${ext === "jpg" ? "jpeg" : ext}`;
+  if (base64Data.length > 7_000_000) return res.status(400).json({ error: "That image is too large — please use a smaller photo (under ~5MB)." });
+
+  const system = `You are extracting multiple-choice questions from a photo or scan of a printed/handwritten question
+paper for the exam-prep platform TestMandi. Read every MCQ question visible in the image, along with its answer options.
+If the correct answer is marked/circled/underlined in the image, use that; otherwise make your best expert judgment of the
+correct answer based on the subject matter, and lower your confidence is fine — just pick the most likely correct option.
+Skip anything that isn't a clear 4-option multiple-choice question (e.g. skip essay questions, fill-in-the-blank, headers,
+instructions). ${QUESTION_JSON_INSTRUCTIONS}`;
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 4000,
+        system,
+        messages: [{
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: mediaType, data: base64Data } },
+            { type: "text", text: "Extract all the multiple-choice questions from this image, as the JSON array only." },
+          ],
+        }],
+      }),
+    });
+    const data = await response.json();
+    const text = (data.content || []).filter((c) => c.type === "text").map((c) => c.text).join("\n").trim();
+    const questions = parseQuestionsJSON(text);
+    if (questions.length === 0) return res.status(502).json({ error: "Couldn't find any clear multiple-choice questions in that image — try a clearer photo." });
+    res.json({ questions });
+  } catch (err) {
+    console.error("Question scanning failed:", err.message);
+    res.status(502).json({ error: "Couldn't process that image right now — please try again.", detail: err.message });
   }
 });
 
