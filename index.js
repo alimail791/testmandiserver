@@ -628,7 +628,17 @@ app.delete("/api/ads/:id", auth, requireRole("admin"), async (req, res) => {
 /* ------------------------------------------------------------------ */
 app.get("/api/referrals/mine", auth, async (req, res) => {
   if (!["buyer", "seller"].includes(req.user.role)) return res.status(403).json({ error: "Not available for this account type." });
-  const user = await db.users.findOne({ email: req.user.email });
+  let user = await db.users.findOne({ email: req.user.email });
+
+  // Accounts created before referral codes existed for this role (or before
+  // sellers had them at all) won't have one on record — generate and save
+  // one now rather than showing "ref=undefined" forever.
+  if (!user.referralCode) {
+    const code = generateReferralCode(user.name);
+    await db.users.updateOne({ id: user.id }, { $set: { referralCode: code } });
+    user = { ...user, referralCode: code };
+  }
+
   const referredCount = await db.users.countDocuments({ referredBy: user.email });
   if (req.user.role === "seller") {
     return res.json({
