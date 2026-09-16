@@ -253,11 +253,29 @@ app.post("/api/auth/register", authLimiter, async (req, res) => {
   if (role === "buyer") {
     user.referralCode = generateReferralCode(user.name);
     const referrer = referralCodeUsed
-      ? await db.users.findOne({ role: "buyer", referralCode: referralCodeUsed.trim().toUpperCase() })
+      ? await db.users.findOne({ referralCode: referralCodeUsed.trim().toUpperCase() })
       : null;
     user.referredBy = referrer ? referrer.email : null;
     user.referralBonusGranted = false;
     user.referralRewards = [];
+  }
+
+  if (role === "seller") {
+    // Sellers get their own referral code too, for TestMandi's seller referral
+    // program — separate from the buyer 50%-off program above. A seller who
+    // refers another seller earns a cash bonus once that new seller publishes
+    // their first test (see /api/tests), and a seller who refers a buyer earns
+    // a cash bonus once that buyer's first purchase completes (see checkout
+    // verify) — instead of a discount, since the referrer here is a business,
+    // not a fellow shopper.
+    user.referralCode = generateReferralCode(user.name);
+    const referrer = referralCodeUsed
+      ? await db.users.findOne({ referralCode: referralCodeUsed.trim().toUpperCase() })
+      : null;
+    user.referredBy = referrer ? referrer.email : null;
+    user.referralBonusGranted = false;
+    user.sellerReferralBonusTotal = 0;
+    user.sellerReferralHistory = [];
   }
 
   await db.users.insertOne(user);
@@ -477,6 +495,8 @@ app.post("/api/tests", auth, requireRole("seller"), async (req, res) => {
     return res.status(400).json({ error: "Missing required test fields, or no questions supplied." });
   }
   const seller = await db.users.findOne({ email: req.user.email });
+  const isFirstTestEver = (await db.tests.countDocuments({ sellerEmail: req.user.email })) === 0;
+
   const test = {
     id: "t_" + Date.now(),
     title: title.trim(), category, price: Number(price), duration: Number(duration),
@@ -485,6 +505,24 @@ app.post("/api/tests", auth, requireRole("seller"), async (req, res) => {
     rating: 0, ratingCount: 0, createdAt: Date.now(),
   };
   await db.tests.insertOne(test);
+
+  // Seller referral program: if this seller was referred by another seller,
+  // and this is their very first published test, credit the referrer a flat
+  // ₹200 cash bonus straight to their payout balance.
+  if (isFirstTestEver && seller.referredBy && !seller.referralBonusGranted) {
+    const referrer = await db.users.findOne({ email: seller.referredBy });
+    if (referrer?.role === "seller") {
+      await db.users.updateOne({ id: seller.id }, { $set: { referralBonusGranted: true } });
+      await db.users.updateOne(
+        { email: seller.referredBy },
+        {
+          $inc: { sellerReferralBonusTotal: 200 },
+          $push: { sellerReferralHistory: { id: "srb_" + Date.now(), ts: Date.now(), amount: 200, type: "seller_joined", fromName: seller.name } },
+        }
+      );
+    }
+  }
+
   res.json({ test });
 });
 
@@ -588,9 +626,17 @@ app.delete("/api/ads/:id", auth, requireRole("admin"), async (req, res) => {
 /* ------------------------------------------------------------------ */
 /* Referrals                                                            */
 /* ------------------------------------------------------------------ */
-app.get("/api/referrals/mine", auth, requireRole("buyer"), async (req, res) => {
+app.get("/api/referrals/mine", auth, async (req, res) => {
+  if (!["buyer", "seller"].includes(req.user.role)) return res.status(403).json({ error: "Not available for this account type." });
   const user = await db.users.findOne({ email: req.user.email });
   const referredCount = await db.users.countDocuments({ referredBy: user.email });
+  if (req.user.role === "seller") {
+    return res.json({
+      referralCode: user.referralCode, referredCount,
+      bonusTotal: user.sellerReferralBonusTotal || 0,
+      history: (user.sellerReferralHistory || []).slice().sort((a, b) => b.ts - a.ts),
+    });
+  }
   res.json({ referralCode: user.referralCode, referredCount, rewards: user.referralRewards || [] });
 });
 
@@ -703,10 +749,26 @@ async function completeCheckout(pending, buyerEmail, paymentId) {
     }
     if (isFirstPurchase && buyer.referredBy && !buyer.referralBonusGranted) {
       await db.users.updateOne({ id: buyer.id }, { $set: { referralBonusGranted: true } });
-      await db.users.updateOne(
-        { email: buyer.referredBy },
-        { $push: { referralRewards: { id: "rw_" + Date.now(), ts: Date.now(), used: false, fromBuyerName: buyer.name } } }
-      );
+      const referrer = await db.users.findOne({ email: buyer.referredBy });
+      if (referrer?.role === "seller") {
+        // Seller referral program: the referring seller earns a flat ₹200
+        // cash bonus (not a discount) once their referred buyer's first
+        // purchase completes — credited straight to their payout balance.
+        await db.users.updateOne(
+          { email: buyer.referredBy },
+          {
+            $inc: { sellerReferralBonusTotal: 200 },
+            $push: { sellerReferralHistory: { id: "srb_" + Date.now(), ts: Date.now(), amount: 200, type: "buyer_purchase", fromName: buyer.name } },
+          }
+        );
+      } else if (referrer) {
+        // Existing buyer-to-buyer program: 50%-off reward on the referrer's
+        // own next purchase.
+        await db.users.updateOne(
+          { email: buyer.referredBy },
+          { $push: { referralRewards: { id: "rw_" + Date.now(), ts: Date.now(), used: false, fromBuyerName: buyer.name } } }
+        );
+      }
     }
   }
   return result;
@@ -867,6 +929,7 @@ app.get("/api/payouts/mine", auth, requireRole("seller"), async (req, res) => {
   const withdrawn = history.filter((p) => !["Failed", "Rejected"].includes(p.status)).reduce((s, p) => s + p.amount, 0);
   res.json({
     bankDetails: user.bankDetails, history, grossEarnings: gross, withdrawn,
+    referralBonusTotal: user.sellerReferralBonusTotal || 0,
     payoutsReady: !!user.payoutsReady, // true = withdrawals are real bank transfers; false = simulated
   });
 });
@@ -877,7 +940,10 @@ app.post("/api/payouts/withdraw", auth, requireRole("seller"), async (req, res) 
 
   const sellerShare = await getSellerSharePercent();
   const gross = await sellerGrossEarnings(req.user.email);
-  const earn = Math.round(gross * (sellerShare / 100));
+  // Referral bonuses are a flat cash incentive funded entirely by the
+  // platform, on top of (not reduced by) the normal seller/platform revenue
+  // split on actual sales.
+  const earn = Math.round(gross * (sellerShare / 100)) + (user.sellerReferralBonusTotal || 0);
   const history = await db.payouts.find({ sellerEmail: req.user.email }).toArray();
   const alreadyWithdrawn = history.filter((p) => !["Failed", "Rejected"].includes(p.status)).reduce((s, p) => s + p.amount, 0);
   const available = Math.max(0, earn - alreadyWithdrawn);
