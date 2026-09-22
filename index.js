@@ -148,6 +148,27 @@ function sellerDisplayName(user) {
   return user.businessName || user.name;
 }
 
+// The single source of truth for "can this buyer use this test" — checked
+// wherever it matters (attempting, rating). A test is accessible via a direct
+// purchase, being included in a purchased bundle, or an unexpired all-access
+// pass for that test's seller. Centralizing this means adding a new access
+// path (like the pass) only requires updating it here, not at every call site.
+async function hasTestAccess(db, buyerEmail, test) {
+  const direct = await db.purchases.findOne({ testId: test.id, buyerEmail });
+  if (direct) return true;
+
+  const bundlePurchases = await db.bundlePurchases.find({ buyerEmail }).toArray();
+  for (const p of bundlePurchases) {
+    const bundle = await db.bundles.findOne({ id: p.bundleId });
+    if (bundle?.testIds.includes(test.id)) return true;
+  }
+
+  const grant = await db.allAccessGrants.findOne({ buyerEmail, sellerEmail: test.sellerEmail });
+  if (grant && grant.expiresAt > Date.now()) return true;
+
+  return false;
+}
+
 function generateReferralCode(name) {
   const base = (name || "USER").replace(/[^a-zA-Z]/g, "").slice(0, 4).toUpperCase() || "USER";
   return `${base}${Math.floor(1000 + Math.random() * 9000)}`;
@@ -536,20 +557,12 @@ app.delete("/api/tests/:id", auth, requireRole("admin"), async (req, res) => {
 
 app.post("/api/tests/:id/rate", auth, requireRole("buyer"), async (req, res) => {
   const value = Number(req.body?.value);
+  const reviewText = (req.body?.reviewText || "").trim().slice(0, 600);
   if (!value || value < 1 || value > 5) return res.status(400).json({ error: "Rating must be 1-5." });
   const test = await db.tests.findOne({ id: req.params.id });
   if (!test) return res.status(404).json({ error: "Test not found." });
 
-  const directPurchase = await db.purchases.findOne({ testId: test.id, buyerEmail: req.user.email });
-  let purchased = !!directPurchase;
-  if (!purchased) {
-    const myBundlePurchases = await db.bundlePurchases.find({ buyerEmail: req.user.email }).toArray();
-    for (const p of myBundlePurchases) {
-      const bundle = await db.bundles.findOne({ id: p.bundleId });
-      if (bundle?.testIds.includes(test.id)) { purchased = true; break; }
-    }
-  }
-  if (!purchased) return res.status(403).json({ error: "You can only rate tests you've purchased." });
+  if (!(await hasTestAccess(db, req.user.email, test))) return res.status(403).json({ error: "You can only rate tests you've purchased." });
 
   const buyer = await db.users.findOne({ email: req.user.email });
   const ratedTestIds = buyer.ratedTestIds || [];
@@ -560,8 +573,20 @@ app.post("/api/tests/:id/rate", auth, requireRole("buyer"), async (req, res) => 
   await db.tests.updateOne({ id: test.id }, { $set: { rating: newRating, ratingCount: newCount } });
   await db.users.updateOne({ id: buyer.id }, { $push: { ratedTestIds: test.id } });
 
+  if (reviewText) {
+    await db.reviews.insertOne({
+      id: "rev_" + Date.now(), testId: test.id, buyerEmail: buyer.email,
+      buyerName: buyer.name, value, text: reviewText, ts: Date.now(),
+    });
+  }
+
   const updatedTest = await db.tests.findOne({ id: test.id });
   res.json({ test: updatedTest });
+});
+
+app.get("/api/tests/:id/reviews", async (req, res) => {
+  const reviews = await db.reviews.find({ testId: req.params.id }).sort({ ts: -1 }).limit(50).toArray();
+  res.json({ reviews: reviews.map((r) => ({ buyerName: r.buyerName, value: r.value, text: r.text, ts: r.ts })) });
 });
 
 /* ------------------------------------------------------------------ */
@@ -656,11 +681,64 @@ app.get("/api/referrals/mine", auth, async (req, res) => {
 /* sent price) and remembers what each order was for, so verify() can't  */
 /* be tricked into unlocking something the buyer didn't actually pay for. */
 /* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+/* Coupons — a seller can create a discount code for one specific test  */
+/* or all of their tests; buyers apply it at checkout.                  */
+/* ------------------------------------------------------------------ */
+app.post("/api/coupons", auth, requireRole("seller"), async (req, res) => {
+  const { code, testId, discountPercent, maxUses, expiresAt } = req.body || {};
+  const cleanCode = (code || "").trim().toUpperCase();
+  if (!cleanCode || cleanCode.length < 3) return res.status(400).json({ error: "Enter a code at least 3 characters long." });
+  const pct = Number(discountPercent);
+  if (!pct || pct < 1 || pct > 90) return res.status(400).json({ error: "Discount must be between 1% and 90%." });
+
+  if (testId) {
+    const test = await db.tests.findOne({ id: testId, sellerEmail: req.user.email });
+    if (!test) return res.status(404).json({ error: "Test not found, or it isn't one of yours." });
+  }
+
+  const existing = await db.coupons.findOne({ code: cleanCode });
+  if (existing) return res.status(409).json({ error: "That code is already in use — pick another." });
+
+  const coupon = {
+    id: "cpn_" + Date.now(), code: cleanCode, sellerEmail: req.user.email,
+    testId: testId || null, discountPercent: pct,
+    maxUses: maxUses ? Number(maxUses) : null, usedCount: 0,
+    expiresAt: expiresAt ? Number(expiresAt) : null, createdAt: Date.now(),
+  };
+  await db.coupons.insertOne(coupon);
+  res.json({ coupon });
+});
+
+app.get("/api/coupons/mine", auth, requireRole("seller"), async (req, res) => {
+  const mine = await db.coupons.find({ sellerEmail: req.user.email }).toArray();
+  res.json({ coupons: mine });
+});
+
+app.delete("/api/coupons/:id", auth, requireRole("seller"), async (req, res) => {
+  const result = await db.coupons.deleteOne({ id: req.params.id, sellerEmail: req.user.email });
+  if (result.deletedCount === 0) return res.status(404).json({ error: "Coupon not found, or it isn't yours." });
+  res.json({ ok: true });
+});
+
+// Validates a coupon against a specific item without redeeming it — lets the
+// checkout UI show the discounted price before the buyer commits to paying.
+async function validateCoupon(code, item, sellerEmail) {
+  const coupon = await db.coupons.findOne({ code: (code || "").trim().toUpperCase() });
+  if (!coupon) return { error: "Coupon not found." };
+  if (coupon.sellerEmail !== sellerEmail) return { error: "This coupon isn't valid for this seller's item." };
+  if (coupon.testId && coupon.testId !== item.id) return { error: "This coupon isn't valid for this item." };
+  if (coupon.expiresAt && coupon.expiresAt < Date.now()) return { error: "This coupon has expired." };
+  if (coupon.maxUses && coupon.usedCount >= coupon.maxUses) return { error: "This coupon has reached its usage limit." };
+  return { coupon };
+}
+
+
 app.post("/api/checkout/create-order", auth, authLimiter, async (req, res) => {
   if (!razorpay) return res.status(503).json({ error: "Payments aren't configured yet — add RAZORPAY_KEY_ID / SECRET to .env." });
 
-  const { kind, itemId, adDraft, applyReward } = req.body || {};
-  let amount, description, rewardId = null;
+  const { kind, itemId, adDraft, applyReward, couponCode } = req.body || {};
+  let amount, description, rewardId = null, couponId = null;
 
   if (kind === "test" || kind === "bundle") {
     if (req.user.role !== "buyer") return res.status(403).json({ error: "Only buyer accounts can purchase tests or bundles." });
@@ -674,6 +752,20 @@ app.post("/api/checkout/create-order", auth, authLimiter, async (req, res) => {
       const reward = (buyer.referralRewards || []).find((r) => !r.used);
       if (reward) { rewardId = reward.id; amount = Math.round(amount * 0.5); }
     }
+
+    if (couponCode) {
+      const { coupon, error } = await validateCoupon(couponCode, item, item.sellerEmail);
+      if (error) return res.status(400).json({ error });
+      couponId = coupon.id;
+      amount = Math.round(amount * (1 - coupon.discountPercent / 100));
+    }
+  } else if (kind === "pass") {
+    if (req.user.role !== "buyer") return res.status(403).json({ error: "Only buyer accounts can purchase an all-access pass." });
+    const pass = await db.allAccessPasses.findOne({ id: itemId });
+    if (!pass) return res.status(404).json({ error: "All-access pass not found." });
+    const seller = await db.users.findOne({ email: pass.sellerEmail });
+    amount = pass.price;
+    description = `All-access pass — ${sellerDisplayName(seller)}`;
   } else if (kind === "ad") {
     if (req.user.role !== "advertiser") return res.status(403).json({ error: "Only advertiser accounts can purchase ads." });
     if (!adDraft?.headline?.trim() || !adDraft?.body?.trim() || !adDraft?.days || adDraft.days < 1) {
@@ -694,7 +786,7 @@ app.post("/api/checkout/create-order", auth, authLimiter, async (req, res) => {
   // Razorpay at all — Razorpay doesn't support zero-amount orders anyway, and
   // there's nothing to pay for.
   if (amount <= 0) {
-    const pending = { kind, itemId: itemId || null, adDraft: adDraft || null, rewardId, amount: 0 };
+    const pending = { kind, itemId: itemId || null, adDraft: adDraft || null, rewardId, couponId, amount: 0 };
     const result = await completeCheckout(pending, req.user.email, null);
     return res.json({ free: true, success: true, ...result });
   }
@@ -707,7 +799,7 @@ app.post("/api/checkout/create-order", auth, authLimiter, async (req, res) => {
     });
 
     await db.pendingOrders.insertOne({
-      orderId: order.id, kind, itemId: itemId || null, adDraft: adDraft || null, rewardId,
+      orderId: order.id, kind, itemId: itemId || null, adDraft: adDraft || null, rewardId, couponId,
       amount, buyerEmail: req.user.email, createdAt: Date.now(),
     });
 
@@ -731,6 +823,20 @@ async function completeCheckout(pending, buyerEmail, paymentId) {
     };
     await db.ads.insertOne(ad);
     result = { ad };
+  } else if (pending.kind === "pass") {
+    // All-access pass: extend from the buyer's current expiry if they already
+    // have one for this seller (so repeat purchases stack rather than reset),
+    // otherwise start fresh from now.
+    const pass = await db.allAccessPasses.findOne({ id: pending.itemId });
+    const existingGrant = await db.allAccessGrants.findOne({ buyerEmail, sellerEmail: pass.sellerEmail });
+    const base = existingGrant && existingGrant.expiresAt > Date.now() ? existingGrant.expiresAt : Date.now();
+    const expiresAt = base + pass.durationDays * 86400000;
+    if (existingGrant) {
+      await db.allAccessGrants.updateOne({ id: existingGrant.id }, { $set: { expiresAt } });
+    } else {
+      await db.allAccessGrants.insertOne({ id: "grant_" + Date.now(), buyerEmail, sellerEmail: pass.sellerEmail, expiresAt, purchasedAt: Date.now() });
+    }
+    result = { grant: { sellerEmail: pass.sellerEmail, expiresAt } };
   } else {
     const priorTestPurchases = await db.purchases.countDocuments({ buyerEmail });
     const priorBundlePurchases = await db.bundlePurchases.countDocuments({ buyerEmail });
@@ -750,6 +856,10 @@ async function completeCheckout(pending, buyerEmail, paymentId) {
       };
       await db.purchases.insertOne(purchase);
       result = { purchase };
+    }
+
+    if (pending.couponId) {
+      await db.coupons.updateOne({ id: pending.couponId }, { $inc: { usedCount: 1 } });
     }
 
     const buyer = await db.users.findOne({ email: buyerEmail });
@@ -820,29 +930,180 @@ app.get("/api/bundle-purchases/mine", auth, requireRole("buyer"), async (req, re
 /* Attempts                                                             */
 /* ------------------------------------------------------------------ */
 app.post("/api/attempts", auth, requireRole("buyer"), async (req, res) => {
-  const { testId, score, total, answers, topicMap, timeTakenSeconds } = req.body || {};
-  const purchasedDirectly = await db.purchases.findOne({ testId, buyerEmail: req.user.email });
-  let unlockedViaBundle = false;
-  if (!purchasedDirectly) {
-    const myBundlePurchases = await db.bundlePurchases.find({ buyerEmail: req.user.email }).toArray();
-    for (const p of myBundlePurchases) {
-      const bundle = await db.bundles.findOne({ id: p.bundleId });
-      if (bundle?.testIds.includes(testId)) { unlockedViaBundle = true; break; }
-    }
+  const { testId, score, total, answers, topicMap, timeTakenSeconds, scheduledTestId } = req.body || {};
+  const test = await db.tests.findOne({ id: testId });
+  if (!test) return res.status(404).json({ error: "Test not found." });
+  if (!(await hasTestAccess(db, req.user.email, test))) return res.status(403).json({ error: "You can only attempt tests you've purchased." });
+
+  // If this attempt claims to be part of a live/scheduled session, verify that
+  // session actually exists, is for this same test, and is (or very recently
+  // was) within its join window — never trust the client's word alone for
+  // something a leaderboard will be ranked on.
+  let verifiedScheduledTestId = null;
+  if (scheduledTestId) {
+    const scheduled = await db.scheduledTests.findOne({ id: scheduledTestId });
+    const now = Date.now();
+    const joinWindowMs = (scheduled?.joinWindowMinutes || 30) * 60 * 1000;
+    const withinJoinWindow = scheduled && now >= scheduled.scheduledStart && now <= scheduled.scheduledStart + joinWindowMs;
+    if (scheduled && scheduled.testId === testId && withinJoinWindow) verifiedScheduledTestId = scheduled.id;
   }
-  if (!purchasedDirectly && !unlockedViaBundle) return res.status(403).json({ error: "You can only attempt tests you've purchased." });
 
   const attempt = {
     id: "a_" + Date.now(), testId, buyerEmail: req.user.email,
     score, total, answers, topicMap, timeTakenSeconds, ts: Date.now(), ratingGiven: null,
+    scheduledTestId: verifiedScheduledTestId,
   };
   await db.attempts.insertOne(attempt);
-  res.json({ attempt });
+
+  // Percentile among everyone who's ever attempted this specific test —
+  // computed fresh each time rather than stored, since it naturally shifts
+  // as more people take the test. Scored as "beat or tied X% of attempts",
+  // using accuracy (score/total) so it's fair even if total ever changes.
+  const allAttempts = await db.attempts.find({ testId }).toArray();
+  const myAccuracy = total > 0 ? score / total : 0;
+  const beatenCount = allAttempts.filter((a) => (a.total > 0 ? a.score / a.total : 0) < myAccuracy).length;
+  const percentile = allAttempts.length > 1 ? Math.round((beatenCount / (allAttempts.length - 1)) * 100) : null;
+
+  res.json({ attempt, percentile });
 });
 
 app.get("/api/attempts/mine", auth, requireRole("buyer"), async (req, res) => {
   const mine = await db.attempts.find({ buyerEmail: req.user.email }).toArray();
   res.json({ attempts: mine });
+});
+
+app.get("/api/tests/:id/analytics", auth, requireRole("seller"), async (req, res) => {
+  const test = await db.tests.findOne({ id: req.params.id, sellerEmail: req.user.email });
+  if (!test) return res.status(404).json({ error: "Test not found, or it isn't one of yours." });
+
+  const attempts = await db.attempts.find({ testId: test.id }).toArray();
+  const totalAttempts = attempts.length;
+  const avgTimeSeconds = totalAttempts > 0
+    ? Math.round(attempts.reduce((s, a) => s + (a.timeTakenSeconds || 0), 0) / totalAttempts)
+    : 0;
+
+  // Per-question accuracy across every attempt — this is what actually tells
+  // a seller which specific questions are confusing or mis-keyed, rather than
+  // just an overall pass rate.
+  const questions = test.questions.map((q, i) => {
+    let correctCount = 0, answeredCount = 0;
+    attempts.forEach((a) => {
+      if (a.answers && a.answers[i] !== undefined && a.answers[i] !== null) {
+        answeredCount++;
+        if (a.answers[i] === q.correct) correctCount++;
+      }
+    });
+    return {
+      index: i, text: q.text, topic: q.topic || "",
+      answeredCount, correctCount,
+      accuracy: answeredCount > 0 ? Math.round((correctCount / answeredCount) * 100) : null,
+    };
+  });
+
+  res.json({ totalAttempts, avgTimeSeconds, questions });
+});
+
+/* ------------------------------------------------------------------ */
+/* Live / scheduled tests — a seller picks one of their existing tests   */
+/* and a start time; buyers who already own that test can join during   */
+/* the join window and see a shared leaderboard once it closes.         */
+/* ------------------------------------------------------------------ */
+app.post("/api/scheduled-tests", auth, requireRole("seller"), async (req, res) => {
+  const { testId, scheduledStart, joinWindowMinutes } = req.body || {};
+  if (!testId || !scheduledStart) return res.status(400).json({ error: "A test and a start time are required." });
+  const test = await db.tests.findOne({ id: testId, sellerEmail: req.user.email });
+  if (!test) return res.status(404).json({ error: "Test not found, or it isn't one of yours." });
+  const start = Number(scheduledStart);
+  if (!Number.isFinite(start) || start <= Date.now()) return res.status(400).json({ error: "Start time must be in the future." });
+
+  const scheduled = {
+    id: "sched_" + Date.now(), testId, sellerEmail: req.user.email,
+    scheduledStart: start, joinWindowMinutes: Math.max(5, Math.min(180, Number(joinWindowMinutes) || 30)),
+    createdAt: Date.now(),
+  };
+  await db.scheduledTests.insertOne(scheduled);
+  res.json({ scheduledTest: scheduled });
+});
+
+app.get("/api/scheduled-tests", async (req, res) => {
+  // Public list — the marketplace shows upcoming and currently-joinable live
+  // sessions to everyone, same as regular tests; ownership is only checked
+  // when someone actually tries to join one.
+  const all = await db.scheduledTests.find({}).toArray();
+  const tests = await db.tests.find({}).toArray();
+  const testById = Object.fromEntries(tests.map((t) => [t.id, t]));
+  const enriched = all
+    .map((s) => ({ ...s, test: testById[s.testId] }))
+    .filter((s) => s.test); // drop any orphaned entry if its test was ever deleted
+  res.json({ scheduledTests: enriched });
+});
+
+app.get("/api/scheduled-tests/mine", auth, requireRole("seller"), async (req, res) => {
+  const mine = await db.scheduledTests.find({ sellerEmail: req.user.email }).toArray();
+  res.json({ scheduledTests: mine });
+});
+
+app.get("/api/scheduled-tests/:id/leaderboard", async (req, res) => {
+  const scheduled = await db.scheduledTests.findOne({ id: req.params.id });
+  if (!scheduled) return res.status(404).json({ error: "Live test not found." });
+  const attempts = await db.attempts.find({ scheduledTestId: scheduled.id }).toArray();
+  const users = await db.users.find({ email: { $in: attempts.map((a) => a.buyerEmail) } }).toArray();
+  const nameByEmail = Object.fromEntries(users.map((u) => [u.email, u.name]));
+  const ranked = attempts
+    .map((a) => ({
+      buyerName: nameByEmail[a.buyerEmail] || "A candidate",
+      score: a.score, total: a.total, timeTakenSeconds: a.timeTakenSeconds || 0,
+    }))
+    .sort((a, b) => b.score - a.score || a.timeTakenSeconds - b.timeTakenSeconds) // higher score wins; faster time breaks ties
+    .map((r, i) => ({ rank: i + 1, ...r }));
+  res.json({ scheduledTest: scheduled, leaderboard: ranked });
+});
+
+/* ------------------------------------------------------------------ */
+/* All-access passes — a seller offers unlimited access to every one of  */
+/* their tests for a fixed price and duration, instead of per-test        */
+/* purchases. Paid via the same one-time Razorpay flow as everything     */
+/* else (see checkout's "pass" kind) — no recurring billing involved,    */
+/* so a buyer renews manually rather than being auto-charged.            */
+/* ------------------------------------------------------------------ */
+app.post("/api/all-access-passes", auth, requireRole("seller"), async (req, res) => {
+  const { price, durationDays } = req.body || {};
+  const p = Number(price), d = Number(durationDays);
+  if (!p || p <= 0) return res.status(400).json({ error: "Enter a valid price." });
+  if (!d || d < 1 || d > 365) return res.status(400).json({ error: "Duration must be between 1 and 365 days." });
+
+  // One active offering per seller — creating a new one replaces the old
+  // price/duration going forward but never touches grants already issued.
+  await db.allAccessPasses.deleteMany({ sellerEmail: req.user.email });
+  const pass = { id: "pass_" + Date.now(), sellerEmail: req.user.email, price: p, durationDays: d, createdAt: Date.now() };
+  await db.allAccessPasses.insertOne(pass);
+  res.json({ pass });
+});
+
+app.get("/api/all-access-passes", async (req, res) => {
+  const all = await db.allAccessPasses.find({}).toArray();
+  const sellers = await db.users.find({ email: { $in: all.map((p) => p.sellerEmail) } }).toArray();
+  const sellerByEmail = Object.fromEntries(sellers.map((s) => [s.email, s]));
+  const enriched = all.map((p) => ({ ...p, sellerName: sellerByEmail[p.sellerEmail] ? sellerDisplayName(sellerByEmail[p.sellerEmail]) : "A seller" }));
+  res.json({ passes: enriched });
+});
+
+app.get("/api/all-access-grants/mine", auth, requireRole("buyer"), async (req, res) => {
+  const grants = await db.allAccessGrants.find({ buyerEmail: req.user.email, expiresAt: { $gt: Date.now() } }).toArray();
+  res.json({ grants });
+});
+
+/* ------------------------------------------------------------------ */
+/* Wishlist — buyers can save a test for later without buying yet.       */
+/* ------------------------------------------------------------------ */
+app.post("/api/wishlist/:testId", auth, requireRole("buyer"), async (req, res) => {
+  await db.users.updateOne({ email: req.user.email }, { $addToSet: { wishlistTestIds: req.params.testId } });
+  res.json({ ok: true });
+});
+
+app.delete("/api/wishlist/:testId", auth, requireRole("buyer"), async (req, res) => {
+  await db.users.updateOne({ email: req.user.email }, { $pull: { wishlistTestIds: req.params.testId } });
+  res.json({ ok: true });
 });
 
 /* ------------------------------------------------------------------ */

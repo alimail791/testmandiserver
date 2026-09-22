@@ -171,6 +171,11 @@ export function getCollections(db) {
     notifications: db.collection("notifications"),
     payouts: db.collection("payouts"),
     ads: db.collection("ads"),
+    scheduledTests: db.collection("scheduledTests"),
+    coupons: db.collection("coupons"),
+    reviews: db.collection("reviews"),
+    allAccessPasses: db.collection("allAccessPasses"),
+    allAccessGrants: db.collection("allAccessGrants"),
     pendingOrders: db.collection("pendingOrders"),
     meta: db.collection("meta"),
   };
