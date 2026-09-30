@@ -245,6 +245,50 @@ async function sendEmail(to, subject, link, actionLabel) {
 // to your single real frontend URL, e.g. https://testmandi.in
 const PUBLIC_APP_URL = process.env.PUBLIC_APP_URL || (process.env.CORS_ORIGIN || "http://localhost:5173").split(",")[0].trim();
 
+// Plain HTML email, no CTA button/link required — used for internal admin
+// notifications rather than user-facing verify/reset emails.
+async function sendPlainEmail(to, subject, htmlBody) {
+  if (emailMode === "none") {
+    console.log(`\n--- email not sent (no provider configured) ---\nTo: ${to}\nSubject: ${subject}\n------------------------------------------------\n`);
+    return;
+  }
+  try {
+    if (emailMode === "resend") {
+      const res = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ from: process.env.RESEND_FROM || "TestMandi <onboarding@resend.dev>", to, subject, html: htmlBody }),
+      });
+      if (!res.ok) throw new Error(`Resend API responded ${res.status}: ${await res.text()}`);
+    } else {
+      await mailer.sendMail({ from: process.env.SMTP_FROM || process.env.SMTP_USER, to, subject, html: htmlBody });
+    }
+  } catch (err) {
+    console.error("Admin notification email failed:", err.message);
+  }
+}
+
+// Fires on every new registration (buyer/seller/advertiser) to let you know
+// right away — fire-and-forget so it never blocks or fails the user's own
+// registration. Defaults to alimail791@gmail.com; override with the
+// ADMIN_NOTIFY_EMAIL env var on Railway if you want it sent elsewhere.
+const ADMIN_NOTIFY_EMAIL = process.env.ADMIN_NOTIFY_EMAIL || "alimail791@gmail.com";
+function notifyAdminOfRegistration(user) {
+  const roleLabel = user.role === "seller" ? "Seller" : user.role === "advertiser" ? "Advertiser" : "Buyer";
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 24px; color: #1B2A4A;">
+      <h2 style="margin: 0 0 16px;">New ${roleLabel} registered on TestMandi</h2>
+      <table style="font-size: 14px; line-height: 1.6; color: #3B4C72;">
+        <tr><td style="padding-right:12px; color:#79705C;">Name</td><td><strong>${user.name}</strong></td></tr>
+        <tr><td style="padding-right:12px; color:#79705C;">Email</td><td>${user.email}</td></tr>
+        <tr><td style="padding-right:12px; color:#79705C;">Phone</td><td>${user.phone || "—"}</td></tr>
+        <tr><td style="padding-right:12px; color:#79705C;">Role</td><td>${roleLabel}</td></tr>
+        ${user.businessName ? `<tr><td style="padding-right:12px; color:#79705C;">Business</td><td>${user.businessName}</td></tr>` : ""}
+      </table>
+    </div>`;
+  sendPlainEmail(ADMIN_NOTIFY_EMAIL, `New ${roleLabel} registered: ${user.name}`, html).catch(() => {});
+}
+
 /* ------------------------------------------------------------------ */
 /* Auth                                                                 */
 /* ------------------------------------------------------------------ */
@@ -301,6 +345,7 @@ app.post("/api/auth/register", authLimiter, async (req, res) => {
 
   await db.users.insertOne(user);
   await sendEmail(user.email, "Verify your TestMandi account", `${PUBLIC_APP_URL}/?verify=${verificationToken}&uid=${user.id}`, "Verify email");
+  notifyAdminOfRegistration(user);
 
   const session = await issueSession(user);
   res.json({ ...session, user: publicUser(user) });
