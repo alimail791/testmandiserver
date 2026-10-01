@@ -92,7 +92,7 @@ function mapPayoutStatus(razorpayXStatus) {
 /* ------------------------------------------------------------------ */
 function publicUser(u) {
   if (!u) return null;
-  const { _id, passwordHash, verificationTokenHash, resetTokenHash, resetTokenExpiresAt, refreshTokens, ...rest } = u;
+  const { _id, passwordHash, verificationTokenHash, otpHash, otpExpiresAt, otpAttempts, resetTokenHash, resetTokenExpiresAt, refreshTokens, ...rest } = u;
   return rest;
 }
 
@@ -245,6 +245,25 @@ async function sendEmail(to, subject, link, actionLabel) {
 // to your single real frontend URL, e.g. https://testmandi.in
 const PUBLIC_APP_URL = process.env.PUBLIC_APP_URL || (process.env.CORS_ORIGIN || "http://localhost:5173").split(",")[0].trim();
 
+// --- Email verification via OTP (replaces the old click-a-link flow) -------
+const OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const OTP_MAX_ATTEMPTS = 5;
+
+function generateOtp() {
+  return String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+}
+
+async function sendOtpEmail(to, otp) {
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 24px; color: #1B2A4A;">
+      <h2 style="margin: 0 0 16px;">Verify your TestMandi account</h2>
+      <p style="font-size: 14px; line-height: 1.5; color: #3B4C72;">Enter this code to verify your email. It expires in 10 minutes.</p>
+      <div style="font-size: 32px; font-weight: 700; letter-spacing: 8px; background: #FBF7EE; color: #1B2A4A; padding: 16px 20px; border-radius: 8px; text-align: center; margin: 20px 0;">${otp}</div>
+      <p style="font-size: 12px; color: #79705C;">If you didn't request this, you can safely ignore this email.</p>
+    </div>`;
+  await sendPlainEmail(to, "Your TestMandi verification code", html);
+}
+
 // Plain HTML email, no CTA button/link required — used for internal admin
 // notifications rather than user-facing verify/reset emails.
 async function sendPlainEmail(to, subject, htmlBody) {
@@ -306,12 +325,12 @@ app.post("/api/auth/register", authLimiter, async (req, res) => {
   if (existing) return res.status(409).json({ error: "An account with that email already exists." });
 
   const passwordHash = await bcrypt.hash(password, 10);
-  const verificationToken = crypto.randomBytes(24).toString("hex");
+  const otp = generateOtp();
   const user = {
     id: "u_" + Date.now(),
     role, name: name.trim(), email: normalizedEmail, phone: (phone || "").trim(),
     businessName: (businessName || "").trim(), passwordHash, bankDetails: null, createdAt: Date.now(),
-    emailVerified: false, verificationTokenHash: hashToken(verificationToken),
+    emailVerified: false, otpHash: hashToken(otp), otpExpiresAt: Date.now() + OTP_TTL_MS, otpAttempts: 0,
     resetTokenHash: null, resetTokenExpiresAt: null, refreshTokens: [],
   };
 
@@ -344,7 +363,7 @@ app.post("/api/auth/register", authLimiter, async (req, res) => {
   }
 
   await db.users.insertOne(user);
-  await sendEmail(user.email, "Verify your TestMandi account", `${PUBLIC_APP_URL}/?verify=${verificationToken}&uid=${user.id}`, "Verify email");
+  await sendOtpEmail(user.email, otp);
   notifyAdminOfRegistration(user);
 
   const session = await issueSession(user);
@@ -409,6 +428,38 @@ app.post("/api/auth/resend-verification", auth, async (req, res) => {
   await db.users.updateOne({ id: user.id }, { $set: { verificationTokenHash: hashToken(verificationToken) } });
 
   await sendEmail(user.email, "Verify your TestMandi account", `${PUBLIC_APP_URL}/?verify=${verificationToken}&uid=${user.id}`, "Verify email");
+  res.json({ ok: true, emailConfigured: emailMode !== "none" });
+});
+
+// OTP-based verification — the flow the signup form now uses: enter the
+// 6-digit code emailed at registration, right there in the signup UI.
+app.post("/api/auth/verify-otp", auth, async (req, res) => {
+  const user = await db.users.findOne({ id: req.user.sub });
+  if (!user) return res.status(404).json({ error: "Account not found." });
+  if (user.emailVerified) return res.json({ ok: true, alreadyVerified: true });
+  if (!user.otpHash || !user.otpExpiresAt || Date.now() > user.otpExpiresAt) {
+    return res.status(400).json({ error: "That code has expired — request a new one." });
+  }
+  if ((user.otpAttempts || 0) >= OTP_MAX_ATTEMPTS) {
+    return res.status(429).json({ error: "Too many incorrect attempts — request a new code." });
+  }
+  const otp = String(req.body?.otp || "").trim();
+  if (!otp || hashToken(otp) !== user.otpHash) {
+    await db.users.updateOne({ id: user.id }, { $inc: { otpAttempts: 1 } });
+    return res.status(400).json({ error: "Incorrect code — please check and try again." });
+  }
+  await db.users.updateOne({ id: user.id }, { $set: { emailVerified: true, otpHash: null, otpExpiresAt: null, otpAttempts: 0 } });
+  res.json({ ok: true });
+});
+
+app.post("/api/auth/resend-otp", auth, authLimiter, async (req, res) => {
+  const user = await db.users.findOne({ id: req.user.sub });
+  if (!user) return res.status(404).json({ error: "Account not found." });
+  if (user.emailVerified) return res.json({ ok: true, alreadyVerified: true });
+
+  const otp = generateOtp();
+  await db.users.updateOne({ id: user.id }, { $set: { otpHash: hashToken(otp), otpExpiresAt: Date.now() + OTP_TTL_MS, otpAttempts: 0 } });
+  await sendOtpEmail(user.email, otp);
   res.json({ ok: true, emailConfigured: emailMode !== "none" });
 });
 
