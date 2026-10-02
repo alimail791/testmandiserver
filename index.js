@@ -1061,10 +1061,31 @@ app.get("/api/bundle-purchases/mine", auth, requireRole("buyer"), async (req, re
 /* Attempts                                                             */
 /* ------------------------------------------------------------------ */
 app.post("/api/attempts", auth, requireRole("buyer"), async (req, res) => {
-  const { testId, score, total, answers, topicMap, timeTakenSeconds, scheduledTestId } = req.body || {};
+  const { testId, answers, timeTakenSeconds, scheduledTestId } = req.body || {};
   const test = await db.tests.findOne({ id: testId });
   if (!test) return res.status(404).json({ error: "Test not found." });
   if (!(await hasTestAccess(db, req.user.email, test))) return res.status(403).json({ error: "You can only attempt tests you've purchased." });
+
+  // Score and the topic breakdown are computed here, from the test's real
+  // answer key, rather than trusting whatever score/total/topicMap the
+  // client sent — a buyer's browser is not a trusted source for the number
+  // their percentile, leaderboard rank, and score report get built from.
+  // `answers` is still client-supplied (it's just which option they picked
+  // per question), but every question gets checked against the real
+  // `correct` index here before anything is stored.
+  const safeAnswers = {};
+  let score = 0;
+  const topicMap = {};
+  test.questions.forEach((qu, i) => {
+    const picked = answers?.[i];
+    if (picked !== undefined && picked !== null) safeAnswers[i] = picked;
+    const topic = qu.topic || "General";
+    topicMap[topic] = topicMap[topic] || { correct: 0, total: 0 };
+    topicMap[topic].total += 1;
+    if (picked === qu.correct) { score += 1; topicMap[topic].correct += 1; }
+  });
+  const total = test.questions.length;
+  const safeTimeTakenSeconds = Math.max(1, Math.min(Number(timeTakenSeconds) || 1, test.duration * 60 + 300));
 
   // If this attempt claims to be part of a live/scheduled session, verify that
   // session actually exists, is for this same test, and is (or very recently
@@ -1081,7 +1102,7 @@ app.post("/api/attempts", auth, requireRole("buyer"), async (req, res) => {
 
   const attempt = {
     id: "a_" + Date.now(), testId, buyerEmail: req.user.email,
-    score, total, answers, topicMap, timeTakenSeconds, ts: Date.now(), ratingGiven: null,
+    score, total, answers: safeAnswers, topicMap, timeTakenSeconds: safeTimeTakenSeconds, ts: Date.now(), ratingGiven: null,
     scheduledTestId: verifiedScheduledTestId,
   };
   await db.attempts.insertOne(attempt);
@@ -1162,7 +1183,7 @@ app.get("/api/scheduled-tests", async (req, res) => {
   // when someone actually tries to join one.
   const all = await db.scheduledTests.find({}).toArray();
   const tests = await db.tests.find({}).toArray();
-  const testById = Object.fromEntries(tests.map((t) => [t.id, t]));
+  const testById = Object.fromEntries(tests.map((t) => [t.id, publicTest(t)]));
   const enriched = all
     .map((s) => ({ ...s, test: testById[s.testId] }))
     .filter((s) => s.test); // drop any orphaned entry if its test was ever deleted
