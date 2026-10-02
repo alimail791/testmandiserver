@@ -592,9 +592,44 @@ app.delete("/api/categories/:name", auth, requireRole("admin"), async (req, res)
 /* ------------------------------------------------------------------ */
 /* Tests                                                                */
 /* ------------------------------------------------------------------ */
+// Strips the real question content (text, options, correct answer index,
+// explanation) out of a test before it goes out on a route anyone can hit
+// without having bought the test. Replaced with safe, derived summary
+// fields — questionCount and the distinct topic names — so marketplace
+// cards, SEO pages, etc. keep working without ever shipping the answer key
+// to an unauthenticated visitor.
+function publicTest(test) {
+  const { questions, ...rest } = test;
+  const seen = new Set();
+  const topics = [];
+  for (const q of questions || []) {
+    const t = (q.topic || "").trim();
+    if (t && !seen.has(t)) { seen.add(t); topics.push(t); }
+  }
+  return { ...rest, questionCount: (questions || []).length, topics };
+}
+
 app.get("/api/tests", async (req, res) => {
   const all = await db.tests.find({}).toArray();
-  res.json({ tests: all.filter((t) => !isBlockedTest(t)) });
+  res.json({ tests: all.filter((t) => !isBlockedTest(t)).map(publicTest) });
+});
+
+// The real questions — including the correct-answer index and explanation —
+// for one test. Unlike GET /api/tests (public, answers stripped), this is
+// gated behind actually having access: a buyer who purchased it (directly,
+// via a bundle, or an all-access pass), the seller who owns it, or an admin.
+// The frontend fetches this on demand, exactly when someone starts an
+// attempt or reviews a completed one — never as part of the public listing.
+app.get("/api/tests/:id/full", auth, async (req, res) => {
+  const test = await db.tests.findOne({ id: req.params.id });
+  if (!test) return res.status(404).json({ error: "Test not found." });
+  const isOwner = req.user.role === "seller" && test.sellerEmail === req.user.email;
+  const isAdmin = req.user.role === "admin";
+  const isBuyerWithAccess = req.user.role === "buyer" && (await hasTestAccess(db, req.user.email, test));
+  if (!isOwner && !isAdmin && !isBuyerWithAccess) {
+    return res.status(403).json({ error: "You don't have access to this test's questions yet." });
+  }
+  res.json({ test });
 });
 
 app.get("/api/tests/mine", auth, requireRole("seller"), async (req, res) => {
@@ -677,7 +712,7 @@ app.post("/api/tests/:id/rate", auth, requireRole("buyer"), async (req, res) => 
   }
 
   const updatedTest = await db.tests.findOne({ id: test.id });
-  res.json({ test: updatedTest });
+  res.json({ test: publicTest(updatedTest) });
 });
 
 app.get("/api/tests/:id/reviews", async (req, res) => {
