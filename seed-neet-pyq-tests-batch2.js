@@ -86,3 +86,4 @@ async function main() {
 main().catch((err) => {
   console.error("Seeding failed (deploy will continue):", err);
 });
+// batch2 seed trigger 1791048887
