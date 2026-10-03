@@ -1,6 +1,6 @@
-// NEET PYQ-sourced practice tests — subject-wise, half mock, full mock.
-// Content is generated from real NEET previous-year-question CSVs
-// (data-neet-tests.json, built by build_tests.py) and inserted here.
+// NEET PYQ + QBank-sourced practice tests — subject-wise, half mock, full mock.
+// Content is generated from real NEET previous-year-question and topic-wise
+// QBank CSVs (data-neet-tests.json, built by build_tests.py) and upserted here.
 //
 // 50 tests total:
 //   - 10 Physics + 10 Chemistry + 10 Biology subject-wise tests
@@ -11,7 +11,10 @@
 // Usage:
 //   node seed-neet-pyq-tests.js
 //
-// Safe to re-run — skips any test whose id already exists.
+// Safe to re-run — upserts by id, so re-running with a refreshed
+// data-neet-tests.json (e.g. after adding more source CSVs) updates each
+// test's content in place instead of skipping it. Rating/ratingCount and
+// the original createdAt are preserved across a refresh.
 
 import "dotenv/config";
 import { MongoClient } from "mongodb";
@@ -43,32 +46,41 @@ async function main() {
     console.warn(`WARNING: seller account ${sellerEmail} not found — inserting tests anyway (matches existing seed-cluster*.js convention). No tests will show a broken seller if this account is created later with this email.`);
   }
 
-  let added = 0, skipped = 0;
+  let added = 0, refreshed = 0;
   for (const t of TESTS) {
     const exists = await tests.findOne({ id: t.id });
+    await tests.updateOne(
+      { id: t.id },
+      {
+        $set: {
+          title: t.title,
+          category: t.category,
+          price: t.price,
+          duration: t.duration,
+          description: t.description,
+          questions: t.questions,
+          sellerEmail,
+          sellerName,
+        },
+        $setOnInsert: {
+          id: t.id,
+          rating: 0,
+          ratingCount: 0,
+          createdAt: Date.now(),
+        },
+      },
+      { upsert: true }
+    );
     if (exists) {
-      skipped++;
-      continue;
+      console.log(`Refreshed "${t.title}" — ${t.questions.length} questions, Rs${t.price}.`);
+      refreshed++;
+    } else {
+      console.log(`Added "${t.title}" — ${t.questions.length} questions, Rs${t.price}.`);
+      added++;
     }
-    await tests.insertOne({
-      id: t.id,
-      title: t.title,
-      category: t.category,
-      price: t.price,
-      duration: t.duration,
-      description: t.description,
-      questions: t.questions,
-      sellerEmail,
-      sellerName,
-      rating: 0,
-      ratingCount: 0,
-      createdAt: Date.now(),
-    });
-    console.log(`Added "${t.title}" — ${t.questions.length} questions, Rs${t.price}.`);
-    added++;
   }
 
-  console.log(`\nDone — ${added} test(s) added, ${skipped} skipped (already existed).`);
+  console.log(`\nDone — ${added} test(s) added, ${refreshed} refreshed (content updated in place).`);
   await client.close();
 }
 
@@ -76,5 +88,3 @@ main().catch((err) => {
   // Never block the app deploy on a seeding failure — log and move on.
   console.error("Seeding failed (deploy will continue):", err);
 });
-// trigger fresh deploy to run preDeployCommand: 1791047065
-// verify-run: 1791047213
