@@ -76,3 +76,4 @@ main().catch((err) => {
   // Never block the app deploy on a seeding failure — log and move on.
   console.error("Seeding failed (deploy will continue):", err);
 });
+// trigger fresh deploy to run preDeployCommand: 1791047065
