@@ -115,7 +115,7 @@ async function issueSession(user) {
   const freshTokens = user.role === "buyer"
     ? [newEntry]
     : [...(user.refreshTokens || []).filter((t) => t.expiresAt > Date.now()), newEntry];
-  await db.users.updateOne({ id: user.id }, { $set: { refreshTokens: freshTokens } });
+  await db.users.updateOne({ id: user.id }, { $set: { refreshTokens: freshTokens, lastActiveAt: Date.now() } });
   return { token: signAccessToken(user), refreshToken: token };
 }
 
@@ -502,6 +502,8 @@ app.post("/api/auth/reset-password", authLimiter, async (req, res) => {
 app.get("/api/auth/me", auth, async (req, res) => {
   const user = await db.users.findOne({ id: req.user.sub });
   if (!user) return res.status(404).json({ error: "Account not found." });
+  // Count opening the app as activity (feeds the 5-day inactivity reminder).
+  db.users.updateOne({ id: user.id }, { $set: { lastActiveAt: Date.now() } }).catch(() => {});
   res.json({ user: publicUser(user) });
 });
 
@@ -1681,5 +1683,81 @@ instructions). ${QUESTION_JSON_INSTRUCTIONS}`;
 });
 
 /* ------------------------------------------------------------------ */
+/* ---- Inactivity ("we miss you") reminder emails ----------------------- */
+const INACTIVITY_DAYS = Number(process.env.INACTIVITY_DAYS) || 5;
+const INACTIVITY_BATCH = 50; // max emails per hourly run
+
+function unsubSig(uid) {
+  return crypto.createHmac("sha256", JWT_SECRET).update(`unsub:${uid}`).digest("hex").slice(0, 32);
+}
+
+app.get("/api/email/unsubscribe", async (req, res) => {
+  const { uid, sig } = req.query;
+  const ok = typeof uid === "string" && typeof sig === "string" && sig.length === 32
+    && crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(unsubSig(uid)));
+  if (!ok) return res.status(400).send("Invalid unsubscribe link.");
+  await db.users.updateOne({ id: uid }, { $set: { reminderEmailsOptOut: true } });
+  res.send("<div style='font-family:Arial;padding:40px;text-align:center'>You've been unsubscribed from TestMandi reminder emails.</div>");
+});
+
+function inactivityEmailHtml(user) {
+  const first = (user.name || "there").split(" ")[0];
+  const isSeller = user.role === "seller";
+  const body = isSeller
+    ? "Your students and sales dashboard are waiting. Log in to check your tests, earnings and payout balance — and refer another seller or student to earn ₹200 each."
+    : "Your tests and progress are waiting. Log in to continue practising — and refer a friend to get 50% off your next test when they buy their first.";
+  const link = PUBLIC_APP_URL;
+  const apiBase = (process.env.PUBLIC_API_URL || "https://testmandiserver-production.up.railway.app").replace(/\/$/, "");
+  const unsubHref = `${apiBase}/api/email/unsubscribe?uid=${encodeURIComponent(user.id)}&sig=${unsubSig(user.id)}`;
+  return `
+    <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 24px; color: #1B2A4A;">
+      <h2 style="margin: 0 0 16px;">We miss you, ${first}!</h2>
+      <p style="font-size: 14px; line-height: 1.6; color: #3B4C72;">It's been a few days since you last visited TestMandi. ${body}</p>
+      <p style="text-align:center;margin:24px 0;"><a href="${link}" style="background:#1B2A4A;color:#FBF7EE;padding:12px 22px;border-radius:6px;text-decoration:none;font-weight:600;">Reactivate my account</a></p>
+      <p style="font-size: 11px; color: #79705C;">Don't want these reminders? <a href="${unsubHref}" style="color:#79705C;">Unsubscribe</a>.</p>
+    </div>`;
+}
+
+async function runInactivityReminders() {
+  if (process.env.INACTIVITY_EMAILS === "off") return;
+  try {
+    const cutoff = Date.now() - INACTIVITY_DAYS * 24 * 60 * 60 * 1000;
+    const due = await db.users.find({
+      role: { $in: ["buyer", "seller"] },
+      emailVerified: { $ne: false },
+      reminderEmailsOptOut: { $ne: true },
+      lastActiveAt: { $lt: cutoff },
+      $expr: { $lt: [{ $ifNull: ["$inactiveReminderSentAt", 0] }, "$lastActiveAt"] },
+    }).limit(INACTIVITY_BATCH).toArray();
+    for (const u of due) {
+      if (!u.email) continue;
+      await sendPlainEmail(u.email, "We miss you at TestMandi — come back and keep going", inactivityEmailHtml(u));
+      await db.users.updateOne({ id: u.id }, { $set: { inactiveReminderSentAt: Date.now() } });
+    }
+    if (due.length) console.log(`Inactivity reminders sent: ${due.length}`);
+  } catch (err) {
+    console.error("Inactivity reminder run failed:", err.message);
+  }
+}
+
+async function startInactivityScheduler() {
+  try {
+    // Existing accounts have no lastActiveAt yet — start their 5-day clock now
+    // so nobody gets a surprise blast on first deploy.
+    const r = await db.users.updateMany(
+      { role: { $in: ["buyer", "seller"] }, lastActiveAt: { $exists: false } },
+      { $set: { lastActiveAt: Date.now() } }
+    );
+    if (r.modifiedCount) console.log(`Backfilled lastActiveAt for ${r.modifiedCount} user(s).`);
+  } catch (err) {
+    console.error("lastActiveAt backfill failed:", err.message);
+  }
+  setTimeout(runInactivityReminders, 2 * 60 * 1000);
+  setInterval(runInactivityReminders, 60 * 60 * 1000);
+}
+
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => console.log(`TestMandi API listening on http://localhost:${PORT}`));
+app.listen(PORT, () => {
+  console.log(`TestMandi API listening on http://localhost:${PORT}`);
+  startInactivityScheduler();
+});
