@@ -611,9 +611,38 @@ function publicTest(test) {
   return { ...rest, questionCount: (questions || []).length, topics };
 }
 
+// The public listing only needs summary fields. Pulling every test with all of
+// its questions out of MongoDB made this endpoint take minutes once the catalogue
+// grew past a few hundred tests (clients timed out and the homepage stayed
+// empty), so the question count and topic list are computed inside the database
+// and the result is cached briefly.
+let testListCache = { at: 0, body: null };
+const TEST_LIST_TTL_MS = 30 * 1000;
+
+async function buildPublicTestList() {
+  const rows = await db.tests.aggregate([
+    { $addFields: {
+        questionCount: { $size: { $ifNull: ["$questions", []] } },
+        topics: { $setUnion: [[], { $ifNull: ["$questions.topic", []] }] },
+      },
+    },
+    { $project: { _id: 0, questions: 0 } },
+  ], { allowDiskUse: true }).toArray();
+  return rows
+    .filter((t) => !isBlockedTest(t))
+    .map((t) => ({ ...t, topics: (t.topics || []).map((x) => (typeof x === "string" ? x.trim() : "")).filter(Boolean) }));
+}
+
 app.get("/api/tests", async (req, res) => {
-  const all = await db.tests.find({}).toArray();
-  res.json({ tests: all.filter((t) => !isBlockedTest(t)).map(publicTest) });
+  try {
+    if (!testListCache.body || Date.now() - testListCache.at > TEST_LIST_TTL_MS) {
+      testListCache = { at: Date.now(), body: { tests: await buildPublicTestList() } };
+    }
+    res.json(testListCache.body);
+  } catch (err) {
+    console.error("Listing tests failed:", err.message);
+    res.status(500).json({ error: "Couldn't load tests right now." });
+  }
 });
 
 // The real questions — including the correct-answer index and explanation —
