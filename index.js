@@ -1508,7 +1508,11 @@ app.get("/api/admin/overview", auth, requireRole("admin"), async (req, res) => {
 // rather than build a dozen narrow aggregation endpoints.
 app.get("/api/admin/all-data", auth, requireRole("admin"), async (req, res) => {
   const [tests, bundles, purchases, bundlePurchases, ads] = await Promise.all([
-    db.tests.find({}).toArray(),
+    // The admin screens only list tests, so leave the (huge) question arrays out.
+    db.tests.aggregate([
+      { $addFields: { questionCount: { $size: { $ifNull: ["$questions", []] } } } },
+      { $project: { questions: 0 } },
+    ], { allowDiskUse: true }).toArray(),
     db.bundles.find({}).toArray(),
     db.purchases.find({}).toArray(),
     db.bundlePurchases.find({}).toArray(),
