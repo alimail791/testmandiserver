@@ -616,8 +616,13 @@ function publicTest(test) {
 // grew past a few hundred tests (clients timed out and the homepage stayed
 // empty), so the question count and topic list are computed inside the database
 // and the result is cached briefly.
-let testListCache = { at: 0, body: null };
-const TEST_LIST_TTL_MS = 30 * 1000;
+// The list is held in memory and rebuilt in the background: visitors are
+// always served the last good copy instantly, and only the very first request
+// after a restart (before the warm-up finishes) ever waits for MongoDB.
+// Simultaneous rebuild requests share one in-flight query.
+let testListCache = { at: 0, body: null, byId: null };
+let testListBuilding = null;
+const TEST_LIST_REFRESH_MS = 5 * 60 * 1000;
 
 async function buildPublicTestList() {
   const rows = await db.tests.aggregate([
@@ -628,17 +633,47 @@ async function buildPublicTestList() {
     },
     { $project: { _id: 0, questions: 0 } },
   ], { allowDiskUse: true }).toArray();
-  return rows
-    .filter((t) => !isBlockedTest(t))
-    .map((t) => ({ ...t, topics: (t.topics || []).map((x) => (typeof x === "string" ? x.trim() : "")).filter(Boolean) }));
+  return rows.map((t) => ({ ...t, topics: (t.topics || []).map((x) => (typeof x === "string" ? x.trim() : "")).filter(Boolean) }));
 }
+
+function refreshTestList() {
+  if (!testListBuilding) {
+    const started = Date.now();
+    testListBuilding = buildPublicTestList()
+      .then((all) => {
+        testListCache = {
+          at: Date.now(),
+          body: { tests: all.filter((t) => !isBlockedTest(t)) },
+          byId: Object.fromEntries(all.map((t) => [t.id, t])),
+        };
+        console.log(`Test list rebuilt: ${all.length} tests in ${Date.now() - started}ms`);
+        return testListCache;
+      })
+      .catch((err) => {
+        console.error("Test list rebuild failed:", err.message);
+        if (!testListCache.body) throw err;
+        return testListCache;
+      })
+      .finally(() => { testListBuilding = null; });
+  }
+  return testListBuilding;
+}
+
+// Returns the cached list, kicking off a background refresh if it is stale.
+async function getTestList() {
+  if (!testListCache.body) return refreshTestList();
+  if (Date.now() - testListCache.at > TEST_LIST_REFRESH_MS) refreshTestList();
+  return testListCache;
+}
+
+refreshTestList().catch(() => {});
+setInterval(() => refreshTestList().catch(() => {}), TEST_LIST_REFRESH_MS);
 
 app.get("/api/tests", async (req, res) => {
   try {
-    if (!testListCache.body || Date.now() - testListCache.at > TEST_LIST_TTL_MS) {
-      testListCache = { at: Date.now(), body: { tests: await buildPublicTestList() } };
-    }
-    res.json(testListCache.body);
+    const { body } = await getTestList();
+    res.set("Cache-Control", "public, max-age=30");
+    res.json(body);
   } catch (err) {
     console.error("Listing tests failed:", err.message);
     res.status(500).json({ error: "Couldn't load tests right now." });
@@ -688,6 +723,7 @@ app.post("/api/tests", auth, requireRole("seller"), async (req, res) => {
     rating: 0, ratingCount: 0, createdAt: Date.now(),
   };
   await db.tests.insertOne(test);
+  refreshTestList().catch(() => {});
 
   // Seller referral program: if this seller was referred by another seller,
   // and this is their very first published test, credit the referrer a flat
@@ -711,6 +747,7 @@ app.post("/api/tests", auth, requireRole("seller"), async (req, res) => {
 
 app.delete("/api/tests/:id", auth, requireRole("admin"), async (req, res) => {
   const result = await db.tests.deleteOne({ id: req.params.id });
+  refreshTestList().catch(() => {});
   if (result.deletedCount === 0) return res.status(404).json({ error: "Test not found." });
   // A test can't be sold on its own after this, but leave any bundle references
   // alone rather than silently rewriting a seller's bundle contents.
@@ -733,6 +770,7 @@ app.post("/api/tests/:id/rate", auth, requireRole("buyer"), async (req, res) => 
   const newCount = test.ratingCount + 1;
   const newRating = (test.rating * test.ratingCount + value) / newCount;
   await db.tests.updateOne({ id: test.id }, { $set: { rating: newRating, ratingCount: newCount } });
+  refreshTestList().catch(() => {});
   await db.users.updateOne({ id: buyer.id }, { $push: { ratedTestIds: test.id } });
 
   if (reviewText) {
@@ -1212,13 +1250,21 @@ app.get("/api/scheduled-tests", async (req, res) => {
   // Public list — the marketplace shows upcoming and currently-joinable live
   // sessions to everyone, same as regular tests; ownership is only checked
   // when someone actually tries to join one.
-  const all = await db.scheduledTests.find({}).toArray();
-  const tests = await db.tests.find({}).toArray();
-  const testById = Object.fromEntries(tests.map((t) => [t.id, publicTest(t)]));
-  const enriched = all
-    .map((s) => ({ ...s, test: testById[s.testId] }))
-    .filter((s) => s.test); // drop any orphaned entry if its test was ever deleted
-  res.json({ scheduledTests: enriched });
+  // Test summaries come from the in-memory list instead of loading every
+  // test (with all its questions) from MongoDB on each request.
+  try {
+    const [all, { byId: testById }] = await Promise.all([
+      db.scheduledTests.find({}).toArray(),
+      getTestList(),
+    ]);
+    const enriched = all
+      .map((s) => ({ ...s, test: testById[s.testId] }))
+      .filter((s) => s.test); // drop any orphaned entry if its test was ever deleted
+    res.json({ scheduledTests: enriched });
+  } catch (err) {
+    console.error("Listing scheduled tests failed:", err.message);
+    res.status(500).json({ error: "Couldn't load live tests right now." });
+  }
 });
 
 app.get("/api/scheduled-tests/mine", auth, requireRole("seller"), async (req, res) => {
