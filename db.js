@@ -127,6 +127,7 @@ export async function initDB() {
   await c.payouts.createIndex({ id: 1 }, { unique: true });
   await c.ads.createIndex({ id: 1 }, { unique: true });
   await c.pendingOrders.createIndex({ orderId: 1 }, { unique: true });
+  await c.users.createIndex({ followingSellers: 1 });
   await c.resources.createIndex({ id: 1 }, { unique: true });
   await c.resources.createIndex({ status: 1, createdAt: -1 });
   await c.resourcePurchases.createIndex({ id: 1 }, { unique: true });

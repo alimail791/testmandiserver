@@ -106,7 +106,7 @@ export async function hasResourceAccess(db, buyerEmail, resource) {
 /* ------------------------------------------------------------------ */
 /* Routes                                                              */
 /* ------------------------------------------------------------------ */
-export function registerResourceRoutes(app, { db, auth, requireRole, sellerDisplayName }) {
+export function registerResourceRoutes(app, { db, auth, requireRole, sellerDisplayName, onPublished }) {
   let listCache = { at: 0, body: null };
   const LIST_TTL_MS = 60 * 1000;
   const invalidate = () => { listCache = { at: 0, body: null }; };
@@ -224,6 +224,7 @@ export function registerResourceRoutes(app, { db, auth, requireRole, sellerDispl
       await db.resources.insertOne(resource);
       invalidate();
       res.json({ resource: publicResource(resource) });
+      if (onPublished) onPublished(resource);
     } catch (err) {
       console.error("Resource upload failed:", err.message);
       res.status(502).json({ error: "We couldn't save your files. Please try again in a minute." });

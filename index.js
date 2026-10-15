@@ -9,6 +9,7 @@ import Razorpay from "razorpay";
 import nodemailer from "nodemailer";
 import { initDB, getCollections } from "./db.js";
 import { registerResourceRoutes } from "./resources.js";
+import { registerFollowRoutes } from "./follow.js";
 
 const mongoDb = await initDB();
 const db = getCollections(mongoDb); // db.users, db.tests, db.meta, etc — real MongoDB collections
@@ -725,6 +726,7 @@ app.post("/api/tests", auth, requireRole("seller"), async (req, res) => {
   };
   await db.tests.insertOne(test);
   refreshTestList().catch(() => {});
+  followRoutes.notifyFollowers(req.user.email, { ...test, kind: "test" });
 
   // Seller referral program: if this seller was referred by another seller,
   // and this is their very first published test, credit the referrer a flat
@@ -793,7 +795,19 @@ app.get("/api/tests/:id/reviews", async (req, res) => {
 /* ------------------------------------------------------------------ */
 /* Resources (worksheets, notes, slides…) — see resources.js           */
 /* ------------------------------------------------------------------ */
-registerResourceRoutes(app, { db, auth, requireRole, sellerDisplayName });
+registerResourceRoutes(app, {
+  db, auth, requireRole, sellerDisplayName,
+  onPublished: (resource) => { followRoutes.notifyFollowers(resource.sellerEmail, { ...resource, kind: "resource" }); },
+});
+
+/* ------------------------------------------------------------------ */
+/* Follow a seller — see follow.js                                      */
+/* ------------------------------------------------------------------ */
+const followRoutes = registerFollowRoutes(app, {
+  db, auth, requireRole, sendPlainEmail, unsubSig, sellerDisplayName,
+  publicAppUrl: PUBLIC_APP_URL,
+  publicApiUrl: process.env.PUBLIC_API_URL || "https://testmandiserver-production.up.railway.app",
+});
 
 /* ------------------------------------------------------------------ */
 /* Bundles                                                              */
