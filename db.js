@@ -127,6 +127,10 @@ export async function initDB() {
   await c.payouts.createIndex({ id: 1 }, { unique: true });
   await c.ads.createIndex({ id: 1 }, { unique: true });
   await c.pendingOrders.createIndex({ orderId: 1 }, { unique: true });
+  await c.resources.createIndex({ id: 1 }, { unique: true });
+  await c.resources.createIndex({ status: 1, createdAt: -1 });
+  await c.resourcePurchases.createIndex({ id: 1 }, { unique: true });
+  await c.resourcePurchases.createIndex({ buyerEmail: 1, resourceId: 1 });
 
   // Categories live as one document (a simple string list) rather than a
   // whole collection, since they're just admin-managed tags.
@@ -177,6 +181,8 @@ export function getCollections(db) {
     allAccessPasses: db.collection("allAccessPasses"),
     allAccessGrants: db.collection("allAccessGrants"),
     pendingOrders: db.collection("pendingOrders"),
+    resources: db.collection("resources"),
+    resourcePurchases: db.collection("resourcePurchases"),
     meta: db.collection("meta"),
   };
 }
