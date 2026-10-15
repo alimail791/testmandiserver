@@ -8,7 +8,7 @@ import rateLimit from "express-rate-limit";
 import Razorpay from "razorpay";
 import nodemailer from "nodemailer";
 import { initDB, getCollections } from "./db.js";
-import { registerResourceRoutes } from "./resources.js";
+import { registerResourceRoutes, ratingBreakdown } from "./resources.js";
 import { registerFollowRoutes } from "./follow.js";
 
 const mongoDb = await initDB();
@@ -776,12 +776,11 @@ app.post("/api/tests/:id/rate", auth, requireRole("buyer"), async (req, res) => 
   refreshTestList().catch(() => {});
   await db.users.updateOne({ id: buyer.id }, { $push: { ratedTestIds: test.id } });
 
-  if (reviewText) {
-    await db.reviews.insertOne({
-      id: "rev_" + Date.now(), testId: test.id, buyerEmail: buyer.email,
-      buyerName: buyer.name, value, text: reviewText, ts: Date.now(),
-    });
-  }
+  // Every rating is stored (text optional) so the star breakdown is complete.
+  await db.reviews.insertOne({
+    id: "rev_" + Date.now(), testId: test.id, buyerEmail: buyer.email,
+    buyerName: buyer.name, value, text: reviewText, ts: Date.now(),
+  });
 
   const updatedTest = await db.tests.findOne({ id: test.id });
   res.json({ test: publicTest(updatedTest) });
@@ -789,7 +788,8 @@ app.post("/api/tests/:id/rate", auth, requireRole("buyer"), async (req, res) => 
 
 app.get("/api/tests/:id/reviews", async (req, res) => {
   const reviews = await db.reviews.find({ testId: req.params.id }).sort({ ts: -1 }).limit(50).toArray();
-  res.json({ reviews: reviews.map((r) => ({ buyerName: r.buyerName, value: r.value, text: r.text, ts: r.ts })) });
+  const breakdown = await ratingBreakdown(db, { testId: req.params.id });
+  res.json({ breakdown, reviews: reviews.map((r) => ({ buyerName: r.buyerName, value: r.value, text: r.text, ts: r.ts })) });
 });
 
 /* ------------------------------------------------------------------ */
@@ -954,13 +954,80 @@ async function validateCoupon(code, item, sellerEmail) {
 }
 
 
+// Prices a cart on the server. Every price comes from the database, never the
+// client. A coupon applies to each item it's valid for (same seller, and the
+// specific test if the coupon is tied to one); a referral reward takes 50% off
+// the single most expensive item. Returns per-line amounts so each seller is
+// credited exactly what was paid for their item.
+const CART_MAX_ITEMS = 20;
+async function priceCart(buyerEmail, rawItems, { couponCode, applyReward }) {
+  const seen = new Set();
+  const items = (Array.isArray(rawItems) ? rawItems : [])
+    .filter((i) => ["test", "bundle", "resource"].includes(i?.kind) && typeof i.itemId === "string")
+    .filter((i) => { const k = `${i.kind}:${i.itemId}`; if (seen.has(k)) return false; seen.add(k); return true; });
+  if (items.length === 0) return { error: "Your cart is empty." };
+  if (items.length > CART_MAX_ITEMS) return { error: `A cart can hold up to ${CART_MAX_ITEMS} items.` };
+
+  const lines = [];
+  for (const i of items) {
+    const doc = i.kind === "test" ? await db.tests.findOne({ id: i.itemId })
+      : i.kind === "bundle" ? await db.bundles.findOne({ id: i.itemId })
+      : await db.resources.findOne({ id: i.itemId, status: "live" });
+    if (!doc) return { error: "One of the items in your cart is no longer available. Remove it and try again.", missing: i };
+    if (i.kind === "test" && (await hasTestAccess(db, buyerEmail, doc))) return { error: `You already own "${doc.title}". Remove it from your cart.`, owned: i };
+    if (i.kind === "bundle" && (await db.bundlePurchases.findOne({ bundleId: doc.id, buyerEmail }))) return { error: `You already own "${doc.title}". Remove it from your cart.`, owned: i };
+    if (i.kind === "resource" && (await db.resourcePurchases.findOne({ resourceId: doc.id, buyerEmail }))) return { error: `You already own "${doc.title}". Remove it from your cart.`, owned: i };
+    lines.push({ kind: i.kind, itemId: doc.id, title: doc.title, sellerEmail: doc.sellerEmail, listPrice: Number(doc.price) || 0, amount: Number(doc.price) || 0, doc });
+  }
+
+  let couponId = null;
+  if (couponCode) {
+    let applied = false, firstError = null;
+    for (const l of lines) {
+      const { coupon, error } = await validateCoupon(couponCode, l.doc, l.doc.sellerEmail);
+      if (error) { firstError = firstError || error; continue; }
+      couponId = coupon.id; applied = true;
+      l.amount = Math.round(l.amount * (1 - coupon.discountPercent / 100));
+    }
+    if (!applied) return { error: firstError === "Coupon not found." ? firstError : "That coupon doesn't apply to anything in your cart." };
+  }
+
+  let rewardId = null;
+  if (applyReward) {
+    const buyer = await db.users.findOne({ email: buyerEmail });
+    const reward = (buyer.referralRewards || []).find((r) => !r.used);
+    const top = lines.reduce((a, b) => (b.amount > (a?.amount ?? -1) ? b : a), null);
+    if (reward && top && top.amount > 0) { rewardId = reward.id; top.amount = Math.round(top.amount * 0.5); }
+  }
+
+  const total = lines.reduce((s2, l) => s2 + l.amount, 0);
+  return {
+    lines: lines.map(({ doc, ...l }) => l),
+    subtotal: lines.reduce((s2, l) => s2 + l.listPrice, 0),
+    total, couponId, rewardId,
+  };
+}
+
+// Lets the cart page show the real total (after coupon/reward) before paying.
+app.post("/api/checkout/quote", auth, requireRole("buyer"), async (req, res) => {
+  const q = await priceCart(req.user.email, req.body?.items, { couponCode: req.body?.couponCode, applyReward: req.body?.applyReward });
+  if (q.error) return res.status(400).json(q);
+  res.json({ lines: q.lines, subtotal: q.subtotal, total: q.total });
+});
+
 app.post("/api/checkout/create-order", auth, authLimiter, async (req, res) => {
   if (!razorpay) return res.status(503).json({ error: "Payments aren't configured yet — add RAZORPAY_KEY_ID / SECRET to .env." });
 
   const { kind, itemId, adDraft, applyReward, couponCode } = req.body || {};
-  let amount, description, rewardId = null, couponId = null;
+  let amount, description, rewardId = null, couponId = null, cartLines = null;
 
-  if (kind === "test" || kind === "bundle" || kind === "resource") {
+  if (kind === "cart") {
+    if (req.user.role !== "buyer") return res.status(403).json({ error: "Only buyer accounts can check out a cart." });
+    const q = await priceCart(req.user.email, req.body?.items, { couponCode, applyReward });
+    if (q.error) return res.status(400).json(q);
+    cartLines = q.lines; amount = q.total; couponId = q.couponId; rewardId = q.rewardId;
+    description = `${q.lines.length} item${q.lines.length > 1 ? "s" : ""} from TestMandi`;
+  } else if (kind === "test" || kind === "bundle" || kind === "resource") {
     if (req.user.role !== "buyer") return res.status(403).json({ error: "Only buyer accounts can purchase tests, bundles or resources." });
     const item = kind === "test" ? await db.tests.findOne({ id: itemId })
       : kind === "bundle" ? await db.bundles.findOne({ id: itemId })
@@ -1011,7 +1078,7 @@ app.post("/api/checkout/create-order", auth, authLimiter, async (req, res) => {
   // Razorpay at all — Razorpay doesn't support zero-amount orders anyway, and
   // there's nothing to pay for.
   if (amount <= 0) {
-    const pending = { kind, itemId: itemId || null, adDraft: adDraft || null, rewardId, couponId, amount: 0 };
+    const pending = { kind, itemId: itemId || null, adDraft: adDraft || null, rewardId, couponId, amount: 0, cartLines };
     const result = await completeCheckout(pending, req.user.email, null);
     return res.json({ free: true, success: true, ...result });
   }
@@ -1024,7 +1091,7 @@ app.post("/api/checkout/create-order", auth, authLimiter, async (req, res) => {
     });
 
     await db.pendingOrders.insertOne({
-      orderId: order.id, kind, itemId: itemId || null, adDraft: adDraft || null, rewardId, couponId,
+      orderId: order.id, kind, itemId: itemId || null, adDraft: adDraft || null, rewardId, couponId, cartLines,
       amount, buyerEmail: req.user.email, createdAt: Date.now(),
     });
 
@@ -1037,6 +1104,23 @@ app.post("/api/checkout/create-order", auth, authLimiter, async (req, res) => {
 });
 
 async function completeCheckout(pending, buyerEmail, paymentId) {
+  // A cart is completed as one purchase per line, each at the amount actually
+  // charged for it; the coupon and referral reward are consumed once.
+  if (pending.kind === "cart") {
+    const purchases = [];
+    for (const l of pending.cartLines || []) {
+      const r = await completeCheckout({ kind: l.kind, itemId: l.itemId, amount: l.amount, rewardId: null, couponId: null }, buyerEmail, paymentId);
+      if (r?.purchase) purchases.push({ kind: l.kind, purchase: r.purchase });
+    }
+    if (pending.couponId) await db.coupons.updateOne({ id: pending.couponId }, { $inc: { usedCount: 1 } });
+    if (pending.rewardId) {
+      const buyer = await db.users.findOne({ email: buyerEmail });
+      const updatedRewards = (buyer.referralRewards || []).map((r) => (r.id === pending.rewardId ? { ...r, used: true } : r));
+      await db.users.updateOne({ id: buyer.id }, { $set: { referralRewards: updatedRewards } });
+    }
+    return { purchases };
+  }
+
   let result;
   if (pending.kind === "ad") {
     const advertiser = await db.users.findOne({ email: buyerEmail });
@@ -1072,21 +1156,21 @@ async function completeCheckout(pending, buyerEmail, paymentId) {
     if (pending.kind === "resource") {
       const resource = await db.resources.findOne({ id: pending.itemId });
       const purchase = {
-        id: "rp_" + Date.now(), resourceId: pending.itemId, sellerEmail: resource?.sellerEmail || null, buyerEmail,
+        id: "rp_" + Date.now() + "_" + crypto.randomBytes(3).toString("hex"), resourceId: pending.itemId, sellerEmail: resource?.sellerEmail || null, buyerEmail,
         price: pending.amount, paymentId: paymentId || null, ts: Date.now(),
       };
       await db.resourcePurchases.insertOne(purchase);
       result = { purchase };
     } else if (pending.kind === "bundle") {
       const purchase = {
-        id: "bp_" + Date.now(), bundleId: pending.itemId, buyerEmail,
+        id: "bp_" + Date.now() + "_" + crypto.randomBytes(3).toString("hex"), bundleId: pending.itemId, buyerEmail,
         price: pending.amount, paymentId: paymentId || null, ts: Date.now(),
       };
       await db.bundlePurchases.insertOne(purchase);
       result = { purchase };
     } else {
       const purchase = {
-        id: "p_" + Date.now(), testId: pending.itemId, buyerEmail,
+        id: "p_" + Date.now() + "_" + crypto.randomBytes(3).toString("hex"), testId: pending.itemId, buyerEmail,
         price: pending.amount, paymentId: paymentId || null, ts: Date.now(),
       };
       await db.purchases.insertOne(purchase);

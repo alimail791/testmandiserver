@@ -9,6 +9,8 @@ import multer from "multer";
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
+// Defaults only — admins can add/remove types and class levels (stored in
+// meta._id "resourceTaxonomy"); see getTaxonomy() below.
 export const RESOURCE_TYPES = ["Worksheet", "Notes", "Question bank", "Slides", "Activity", "Lesson plan", "Study guide", "Other"];
 export const RESOURCE_GRADES = ["Pre-primary", "Class 1-5", "Class 6-8", "Class 9-10", "Class 11-12", "College", "Competitive exams"];
 export const RESOURCE_LANGUAGES = ["English", "Hindi", "Tamil", "Telugu", "Kannada", "Malayalam", "Marathi", "Bengali", "Gujarati", "Other"];
@@ -111,8 +113,44 @@ export function registerResourceRoutes(app, { db, auth, requireRole, sellerDispl
   const LIST_TTL_MS = 60 * 1000;
   const invalidate = () => { listCache = { at: 0, body: null }; };
 
-  app.get("/api/resources/options", (req, res) => {
-    res.json({ types: RESOURCE_TYPES, grades: RESOURCE_GRADES, languages: RESOURCE_LANGUAGES, uploadsEnabled: storageEnabled });
+  // Resource categories (types) and class levels are admin-managed, like
+  // exam categories for tests. Seeded with the defaults on first use.
+  async function getTaxonomy() {
+    let doc = await db.meta.findOne({ _id: "resourceTaxonomy" });
+    if (!doc) {
+      doc = { _id: "resourceTaxonomy", types: RESOURCE_TYPES, grades: RESOURCE_GRADES };
+      await db.meta.updateOne({ _id: "resourceTaxonomy" }, { $setOnInsert: { types: doc.types, grades: doc.grades } }, { upsert: true });
+    }
+    return { types: doc.types || [], grades: doc.grades || [] };
+  }
+
+  app.get("/api/resources/options", async (req, res) => {
+    const { types, grades } = await getTaxonomy();
+    res.json({ types, grades, languages: RESOURCE_LANGUAGES, uploadsEnabled: storageEnabled });
+  });
+
+  const TAXONOMY_FIELD = { types: "resourceType", grades: "grade" };
+
+  app.post("/api/admin/resource-taxonomy/:list", auth, requireRole("admin"), async (req, res) => {
+    const list = req.params.list;
+    if (!TAXONOMY_FIELD[list]) return res.status(404).json({ error: "Unknown list." });
+    const name = String(req.body?.name || "").trim().slice(0, 40);
+    if (!name) return res.status(400).json({ error: "Enter a name." });
+    const tax = await getTaxonomy();
+    if (tax[list].some((x) => x.toLowerCase() === name.toLowerCase())) return res.status(409).json({ error: "That one already exists." });
+    await db.meta.updateOne({ _id: "resourceTaxonomy" }, { $push: { [list]: name } });
+    res.json(await getTaxonomy());
+  });
+
+  app.delete("/api/admin/resource-taxonomy/:list/:name", auth, requireRole("admin"), async (req, res) => {
+    const list = req.params.list;
+    if (!TAXONOMY_FIELD[list]) return res.status(404).json({ error: "Unknown list." });
+    const name = req.params.name;
+    const inUse = await db.resources.countDocuments({ [TAXONOMY_FIELD[list]]: name, status: "live" });
+    if (inUse > 0) return res.status(409).json({ error: `"${name}" is used by ${inUse} live resource(s). Remove or change those first.` });
+    await getTaxonomy();
+    await db.meta.updateOne({ _id: "resourceTaxonomy" }, { $pull: { [list]: name } });
+    res.json(await getTaxonomy());
   });
 
   app.get("/api/resources", async (req, res) => {
@@ -175,8 +213,9 @@ export function registerResourceRoutes(app, { db, auth, requireRole, sellerDispl
     if (!b.title?.trim()) return res.status(400).json({ error: "Add a title." });
     if (!file) return res.status(400).json({ error: "Attach the resource file (PDF, Word, PowerPoint, Excel or ZIP)." });
     if (!Number.isFinite(price) || price < 0 || price > 10000) return res.status(400).json({ error: "Price must be between ₹0 (free) and ₹10,000." });
-    if (!RESOURCE_TYPES.includes(b.resourceType)) return res.status(400).json({ error: "Choose a resource type." });
-    if (!RESOURCE_GRADES.includes(b.grade)) return res.status(400).json({ error: "Choose a class or level." });
+    const tax = await getTaxonomy();
+    if (!tax.types.includes(b.resourceType)) return res.status(400).json({ error: "Choose a resource type." });
+    if (!tax.grades.includes(b.grade)) return res.status(400).json({ error: "Choose a class or level." });
     if (b.language && !RESOURCE_LANGUAGES.includes(b.language)) return res.status(400).json({ error: "Choose a language from the list." });
 
     const ext = extOf(file.originalname);
@@ -301,17 +340,24 @@ export function registerResourceRoutes(app, { db, auth, requireRole, sellerDispl
     const newRating = ((r.rating || 0) * (r.ratingCount || 0) + value) / newCount;
     await db.resources.updateOne({ id: r.id }, { $set: { rating: newRating, ratingCount: newCount } });
     await db.users.updateOne({ id: buyer.id }, { $push: { ratedResourceIds: r.id } });
-    if (reviewText) {
-      await db.reviews.insertOne({ id: "rev_" + Date.now(), resourceId: r.id, buyerEmail: buyer.email, buyerName: buyer.name, value, text: reviewText, ts: Date.now() });
-    }
+    await db.reviews.insertOne({ id: "rev_" + Date.now(), resourceId: r.id, buyerEmail: buyer.email, buyerName: buyer.name, value, text: reviewText, ts: Date.now() });
     invalidate();
     res.json({ resource: publicResource(await db.resources.findOne({ id: r.id })) });
   });
 
   app.get("/api/resources/:id/reviews", async (req, res) => {
     const reviews = await db.reviews.find({ resourceId: req.params.id }).sort({ ts: -1 }).limit(50).toArray();
-    res.json({ reviews: reviews.map((r) => ({ buyerName: r.buyerName, value: r.value, text: r.text, ts: r.ts })) });
+    const breakdown = await ratingBreakdown(db, { resourceId: req.params.id });
+    res.json({ breakdown, reviews: reviews.map((r) => ({ buyerName: r.buyerName, value: r.value, text: r.text, ts: r.ts })) });
   });
 
   return { invalidate };
+}
+
+// Count of ratings at each star level (5..1) for one item.
+export async function ratingBreakdown(db, match) {
+  const rows = await db.reviews.aggregate([{ $match: match }, { $group: { _id: "$value", n: { $sum: 1 } } }]).toArray();
+  const out = { 5: 0, 4: 0, 3: 0, 2: 0, 1: 0 };
+  for (const r of rows) if (out[r._id] !== undefined) out[r._id] = r.n;
+  return out;
 }
