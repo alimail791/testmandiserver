@@ -8,6 +8,8 @@ import rateLimit from "express-rate-limit";
 import Razorpay from "razorpay";
 import nodemailer from "nodemailer";
 import { initDB, getCollections } from "./db.js";
+import { registerResourceRoutes } from "./resources.js";
+import { registerFollowRoutes } from "./follow.js";
 
 const mongoDb = await initDB();
 const db = getCollections(mongoDb); // db.users, db.tests, db.meta, etc — real MongoDB collections
@@ -724,6 +726,7 @@ app.post("/api/tests", auth, requireRole("seller"), async (req, res) => {
   };
   await db.tests.insertOne(test);
   refreshTestList().catch(() => {});
+  followRoutes.notifyFollowers(req.user.email, { ...test, kind: "test" });
 
   // Seller referral program: if this seller was referred by another seller,
   // and this is their very first published test, credit the referrer a flat
@@ -787,6 +790,23 @@ app.post("/api/tests/:id/rate", auth, requireRole("buyer"), async (req, res) => 
 app.get("/api/tests/:id/reviews", async (req, res) => {
   const reviews = await db.reviews.find({ testId: req.params.id }).sort({ ts: -1 }).limit(50).toArray();
   res.json({ reviews: reviews.map((r) => ({ buyerName: r.buyerName, value: r.value, text: r.text, ts: r.ts })) });
+});
+
+/* ------------------------------------------------------------------ */
+/* Resources (worksheets, notes, slides…) — see resources.js           */
+/* ------------------------------------------------------------------ */
+registerResourceRoutes(app, {
+  db, auth, requireRole, sellerDisplayName,
+  onPublished: (resource) => { followRoutes.notifyFollowers(resource.sellerEmail, { ...resource, kind: "resource" }); },
+});
+
+/* ------------------------------------------------------------------ */
+/* Follow a seller — see follow.js                                      */
+/* ------------------------------------------------------------------ */
+const followRoutes = registerFollowRoutes(app, {
+  db, auth, requireRole, sendPlainEmail, unsubSig, sellerDisplayName,
+  publicAppUrl: PUBLIC_APP_URL,
+  publicApiUrl: process.env.PUBLIC_API_URL || "https://testmandiserver-production.up.railway.app",
 });
 
 /* ------------------------------------------------------------------ */
@@ -940,10 +960,15 @@ app.post("/api/checkout/create-order", auth, authLimiter, async (req, res) => {
   const { kind, itemId, adDraft, applyReward, couponCode } = req.body || {};
   let amount, description, rewardId = null, couponId = null;
 
-  if (kind === "test" || kind === "bundle") {
-    if (req.user.role !== "buyer") return res.status(403).json({ error: "Only buyer accounts can purchase tests or bundles." });
-    const item = kind === "test" ? await db.tests.findOne({ id: itemId }) : await db.bundles.findOne({ id: itemId });
+  if (kind === "test" || kind === "bundle" || kind === "resource") {
+    if (req.user.role !== "buyer") return res.status(403).json({ error: "Only buyer accounts can purchase tests, bundles or resources." });
+    const item = kind === "test" ? await db.tests.findOne({ id: itemId })
+      : kind === "bundle" ? await db.bundles.findOne({ id: itemId })
+      : await db.resources.findOne({ id: itemId, status: "live" });
     if (!item) return res.status(404).json({ error: "Item not found." });
+    if (kind === "resource" && (await db.resourcePurchases.findOne({ resourceId: item.id, buyerEmail: req.user.email }))) {
+      return res.status(409).json({ error: "You already own this resource. Find it under My Learning → Resources." });
+    }
     amount = item.price;
     description = item.title;
 
@@ -1040,9 +1065,19 @@ async function completeCheckout(pending, buyerEmail, paymentId) {
   } else {
     const priorTestPurchases = await db.purchases.countDocuments({ buyerEmail });
     const priorBundlePurchases = await db.bundlePurchases.countDocuments({ buyerEmail });
-    const isFirstPurchase = priorTestPurchases === 0 && priorBundlePurchases === 0;
+    const priorResourcePurchases = await db.resourcePurchases.countDocuments({ buyerEmail, price: { $gt: 0 } });
+    // Free resource downloads don't count as a "first purchase" for referral bonuses.
+    const isFirstPurchase = priorTestPurchases === 0 && priorBundlePurchases === 0 && priorResourcePurchases === 0 && pending.amount > 0;
 
-    if (pending.kind === "bundle") {
+    if (pending.kind === "resource") {
+      const resource = await db.resources.findOne({ id: pending.itemId });
+      const purchase = {
+        id: "rp_" + Date.now(), resourceId: pending.itemId, sellerEmail: resource?.sellerEmail || null, buyerEmail,
+        price: pending.amount, paymentId: paymentId || null, ts: Date.now(),
+      };
+      await db.resourcePurchases.insertOne(purchase);
+      result = { purchase };
+    } else if (pending.kind === "bundle") {
       const purchase = {
         id: "bp_" + Date.now(), bundleId: pending.itemId, buyerEmail,
         price: pending.amount, paymentId: paymentId || null, ts: Date.now(),
@@ -1416,7 +1451,9 @@ async function sellerGrossEarnings(sellerEmail) {
   const myBundleIds = myBundles.map((b) => b.id);
   const testSales = await db.purchases.find({ testId: { $in: myTestIds } }).toArray();
   const bundleSales = await db.bundlePurchases.find({ bundleId: { $in: myBundleIds } }).toArray();
-  return testSales.reduce((s, p) => s + p.price, 0) + bundleSales.reduce((s, p) => s + p.price, 0);
+  const resourceSales = await db.resourcePurchases.find({ sellerEmail }).toArray();
+  return testSales.reduce((s, p) => s + p.price, 0) + bundleSales.reduce((s, p) => s + p.price, 0)
+    + resourceSales.reduce((s, p) => s + p.price, 0);
 }
 
 app.get("/api/payouts/mine", auth, requireRole("seller"), async (req, res) => {
@@ -1553,7 +1590,7 @@ app.get("/api/admin/overview", auth, requireRole("admin"), async (req, res) => {
 // tables — small enough at this scale to just ship everything at once
 // rather than build a dozen narrow aggregation endpoints.
 app.get("/api/admin/all-data", auth, requireRole("admin"), async (req, res) => {
-  const [tests, bundles, purchases, bundlePurchases, ads] = await Promise.all([
+  const [tests, bundles, purchases, bundlePurchases, ads, resources, resourcePurchases] = await Promise.all([
     // The admin screens only list tests, so leave the (huge) question arrays out.
     db.tests.aggregate([
       { $addFields: { questionCount: { $size: { $ifNull: ["$questions", []] } } } },
@@ -1563,8 +1600,10 @@ app.get("/api/admin/all-data", auth, requireRole("admin"), async (req, res) => {
     db.purchases.find({}).toArray(),
     db.bundlePurchases.find({}).toArray(),
     db.ads.find({}).toArray(),
+    db.resources.find({}, { projection: { fileKey: 0, coverKey: 0, previewKeys: 0 } }).toArray(),
+    db.resourcePurchases.find({}).toArray(),
   ]);
-  res.json({ tests, bundles, purchases, bundlePurchases, ads });
+  res.json({ tests, bundles, purchases, bundlePurchases, ads, resources, resourcePurchases });
 });
 
 // Sellers without a RazorpayX fund account get queued here instead of an
