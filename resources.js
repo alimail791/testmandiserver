@@ -361,3 +361,58 @@ export async function ratingBreakdown(db, match) {
   for (const r of rows) if (out[r._id] !== undefined) out[r._id] = r.n;
   return out;
 }
+
+/* ------------------------------------------------------------------ */
+/* Test covers — optional seller-uploaded cover image for an MCQ test  */
+/* ------------------------------------------------------------------ */
+const coverUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_IMAGE_BYTES, files: 1 } }).single("cover");
+
+export function registerTestCoverRoutes(app, { db, auth, requireRole, onTestChanged }) {
+  app.post("/api/tests/:id/cover", auth, requireRole("seller", "admin"), (req, res, next) => {
+    coverUpload(req, res, (err) => {
+      if (!err) return next();
+      res.status(400).json({ error: err.code === "LIMIT_FILE_SIZE" ? "The cover image must be under 3 MB." : "Upload one PNG, JPG or WEBP image." });
+    });
+  }, async (req, res) => {
+    if (!storageEnabled) return res.status(503).json({ error: "Image uploads aren't switched on yet." });
+    const test = await db.tests.findOne({ id: req.params.id }, { projection: { questions: 0 } });
+    if (!test) return res.status(404).json({ error: "Test not found." });
+    if (req.user.role === "seller" && test.sellerEmail !== req.user.email) return res.status(403).json({ error: "You can only change covers on your own tests." });
+    const img = req.file;
+    if (!img || !IMAGE_TYPES[img.mimetype]) return res.status(400).json({ error: "Choose a PNG, JPG or WEBP image." });
+    try {
+      // New key each time so browsers and the CDN never show a stale cover.
+      const coverKey = `tests/${test.id}/cover-${Date.now()}.${IMAGE_TYPES[img.mimetype]}`;
+      await putObject(coverKey, img.buffer, img.mimetype);
+      await db.tests.updateOne({ id: test.id }, { $set: { coverKey, coverVersion: Date.now() } });
+      if (onTestChanged) onTestChanged();
+      res.json({ ok: true, hasCover: true, coverVersion: Date.now() });
+    } catch (e) {
+      console.error("Test cover upload failed:", e.message);
+      res.status(502).json({ error: "Couldn't save the image. Please try again." });
+    }
+  });
+
+  app.delete("/api/tests/:id/cover", auth, requireRole("seller", "admin"), async (req, res) => {
+    const test = await db.tests.findOne({ id: req.params.id }, { projection: { questions: 0 } });
+    if (!test) return res.status(404).json({ error: "Test not found." });
+    if (req.user.role === "seller" && test.sellerEmail !== req.user.email) return res.status(403).json({ error: "You can only change covers on your own tests." });
+    await db.tests.updateOne({ id: test.id }, { $set: { coverKey: null } });
+    if (onTestChanged) onTestChanged();
+    res.json({ ok: true, hasCover: false });
+  });
+
+  app.get("/api/tests/:id/cover", async (req, res) => {
+    if (!storageEnabled) return res.status(404).end();
+    const test = await db.tests.findOne({ id: req.params.id }, { projection: { coverKey: 1 } });
+    if (!test?.coverKey) return res.status(404).end();
+    try {
+      const obj = await s3.send(new GetObjectCommand({ Bucket: bucketName, Key: test.coverKey }));
+      res.set("Content-Type", obj.ContentType || "image/jpeg");
+      res.set("Cache-Control", "public, max-age=86400");
+      obj.Body.pipe(res);
+    } catch (e) {
+      res.status(404).end();
+    }
+  });
+}
