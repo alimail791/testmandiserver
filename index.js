@@ -8,7 +8,7 @@ import rateLimit from "express-rate-limit";
 import Razorpay from "razorpay";
 import nodemailer from "nodemailer";
 import { initDB, getCollections } from "./db.js";
-import { registerResourceRoutes, ratingBreakdown } from "./resources.js";
+import { registerResourceRoutes, registerTestCoverRoutes, ratingBreakdown } from "./resources.js";
 import { registerFollowRoutes } from "./follow.js";
 
 const mongoDb = await initDB();
@@ -603,7 +603,8 @@ app.delete("/api/categories/:name", auth, requireRole("admin"), async (req, res)
 // cards, SEO pages, etc. keep working without ever shipping the answer key
 // to an unauthenticated visitor.
 function publicTest(test) {
-  const { questions, ...rest } = test;
+  const { questions, coverKey, ...rest } = test;
+  rest.hasCover = !!coverKey;
   const seen = new Set();
   const topics = [];
   for (const q of questions || []) {
@@ -635,7 +636,7 @@ async function buildPublicTestList() {
     },
     { $project: { _id: 0, questions: 0 } },
   ], { allowDiskUse: true }).toArray();
-  return rows.map((t) => ({ ...t, topics: (t.topics || []).map((x) => (typeof x === "string" ? x.trim() : "")).filter(Boolean) }));
+  return rows.map(({ coverKey, ...t }) => ({ ...t, hasCover: !!coverKey, topics: (t.topics || []).map((x) => (typeof x === "string" ? x.trim() : "")).filter(Boolean) }));
 }
 
 function refreshTestList() {
@@ -704,7 +705,7 @@ app.get("/api/tests/mine", auth, requireRole("seller"), async (req, res) => {
   const mine = await db.tests.find({ sellerEmail: req.user.email }).toArray();
   const withSales = await Promise.all(mine.map(async (t) => {
     const sales = await db.purchases.find({ testId: t.id }).toArray();
-    return { ...t, unitsSold: sales.length, gross: sales.reduce((s, p) => s + p.price, 0) };
+    return { ...t, hasCover: !!t.coverKey, unitsSold: sales.length, gross: sales.reduce((s, p) => s + p.price, 0) };
   }));
   res.json({ tests: withSales });
 });
@@ -795,6 +796,8 @@ app.get("/api/tests/:id/reviews", async (req, res) => {
 /* ------------------------------------------------------------------ */
 /* Resources (worksheets, notes, slides…) — see resources.js           */
 /* ------------------------------------------------------------------ */
+registerTestCoverRoutes(app, { db, auth, requireRole, onTestChanged: () => refreshTestList().catch(() => {}) });
+
 registerResourceRoutes(app, {
   db, auth, requireRole, sellerDisplayName,
   onPublished: (resource) => { followRoutes.notifyFollowers(resource.sellerEmail, { ...resource, kind: "resource" }); },
