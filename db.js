@@ -185,6 +185,7 @@ export function getCollections(db) {
     resources: db.collection("resources"),
     resourcePurchases: db.collection("resourcePurchases"),
     meta: db.collection("meta"),
+    blogPosts: db.collection("blogPosts"),
   };
 }
 
