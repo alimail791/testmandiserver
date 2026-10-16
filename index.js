@@ -561,7 +561,7 @@ app.post("/api/auth/update-account", auth, authLimiter, async (req, res) => {
 /* ------------------------------------------------------------------ */
 /* Settings — persisted, admin-controlled platform config              */
 /* ------------------------------------------------------------------ */
-const DEFAULT_SELLER_SHARE = 70;
+const DEFAULT_SELLER_SHARE = 80;
 
 async function getSellerSharePercent() {
   const doc = await db.meta.findOne({ _id: "settings" });
