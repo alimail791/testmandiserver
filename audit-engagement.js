@@ -20,7 +20,7 @@ const stat = (u) => {
   if ((u.inactiveReminderSentAt || 0) >= u.lastActiveAt) return "already-emailed-this-absence";
   return "DUE-NOW";
 };
-console.log("ENG inactivity status", JSON.stringify(by.call(null, () => "") && bu.reduce((a, u) => ((a[stat(u)] = (a[stat(u)] || 0) + 1), a), {})));
+console.log("ENG inactivity status", JSON.stringify(bu.reduce((a, u) => ((a[stat(u)] = (a[stat(u)] || 0) + 1), a), {})));
 const age = (t) => (t ? Math.floor((now - t) / 864e5) : "none");
 console.log("ENG days since lastActive (buyer/seller)", JSON.stringify(bu.reduce((a, u) => ((a[age(u.lastActiveAt)] = (a[age(u.lastActiveAt)] || 0) + 1), a), {})));
 console.log("ENG reminders ever sent", bu.filter((u) => u.inactiveReminderSentAt).length);
