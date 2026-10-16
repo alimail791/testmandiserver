@@ -178,6 +178,10 @@ function generateReferralCode(name) {
 
 const AD_COST_HOMEPAGE = 500;
 const AD_COST_CATEGORY = 200;
+// Advertiser refer & earn: an advertiser whose referred advertiser pays for
+// their first ad gets one free ad (up to this many days; longer ads pay only
+// for the extra days).
+const FREE_AD_DAYS = Number(process.env.FREE_AD_DAYS) || 7;
 
 // Real email sending. Two options, tried in this order:
 //
@@ -362,6 +366,19 @@ app.post("/api/auth/register", authLimiter, async (req, res) => {
     user.referralBonusGranted = false;
     user.sellerReferralBonusTotal = 0;
     user.sellerReferralHistory = [];
+  }
+
+  if (role === "advertiser") {
+    // Advertiser refer & earn: when an advertiser this user referred pays for
+    // their first ad, the referrer earns one free ad (see completeCheckout).
+    user.referralCode = generateReferralCode(user.name);
+    const referrer = referralCodeUsed
+      ? await db.users.findOne({ referralCode: referralCodeUsed.trim().toUpperCase() })
+      : null;
+    user.referredBy = referrer ? referrer.email : null;
+    user.referralBonusGranted = false;
+    user.freeAdCredits = 0;
+    user.adReferralHistory = [];
   }
 
   await db.users.insertOne(user);
@@ -875,7 +892,7 @@ app.delete("/api/ads/:id", auth, requireRole("admin"), async (req, res) => {
 /* Referrals                                                            */
 /* ------------------------------------------------------------------ */
 app.get("/api/referrals/mine", auth, async (req, res) => {
-  if (!["buyer", "seller"].includes(req.user.role)) return res.status(403).json({ error: "Not available for this account type." });
+  if (!["buyer", "seller", "advertiser"].includes(req.user.role)) return res.status(403).json({ error: "Not available for this account type." });
   let user = await db.users.findOne({ email: req.user.email });
 
   // Accounts created before referral codes existed for this role (or before
@@ -888,6 +905,13 @@ app.get("/api/referrals/mine", auth, async (req, res) => {
   }
 
   const referredCount = await db.users.countDocuments({ referredBy: user.email });
+  if (req.user.role === "advertiser") {
+    return res.json({
+      referralCode: user.referralCode, referredCount,
+      freeAdCredits: user.freeAdCredits || 0, freeAdDays: FREE_AD_DAYS,
+      history: (user.adReferralHistory || []).slice().sort((a, b) => b.ts - a.ts),
+    });
+  }
   if (req.user.role === "seller") {
     return res.json({
       referralCode: user.referralCode, referredCount,
@@ -1022,7 +1046,7 @@ app.post("/api/checkout/create-order", auth, authLimiter, async (req, res) => {
   if (!razorpay) return res.status(503).json({ error: "Payments aren't configured yet — add RAZORPAY_KEY_ID / SECRET to .env." });
 
   const { kind, itemId, adDraft, applyReward, couponCode } = req.body || {};
-  let amount, description, rewardId = null, couponId = null, cartLines = null;
+  let amount, description, rewardId = null, couponId = null, cartLines = null, freeAdUsed = false;
 
   if (kind === "cart") {
     if (req.user.role !== "buyer") return res.status(403).json({ error: "Only buyer accounts can check out a cart." });
@@ -1073,6 +1097,13 @@ app.post("/api/checkout/create-order", auth, authLimiter, async (req, res) => {
     const costPerDay = adDraft.placement === "homepage" ? AD_COST_HOMEPAGE : AD_COST_CATEGORY;
     amount = costPerDay * Number(adDraft.days);
     description = `Ad: ${adDraft.headline}`;
+    if (adDraft.useFreeAd) {
+      const advertiser = await db.users.findOne({ email: req.user.email });
+      if ((advertiser.freeAdCredits || 0) < 1) return res.status(400).json({ error: "You don't have a free ad to use right now." });
+      freeAdUsed = true;
+      amount = costPerDay * Math.max(0, Number(adDraft.days) - FREE_AD_DAYS);
+      description = `Ad: ${adDraft.headline} (free ad applied)`;
+    }
   } else {
     return res.status(400).json({ error: "Invalid checkout kind." });
   }
@@ -1081,7 +1112,7 @@ app.post("/api/checkout/create-order", auth, authLimiter, async (req, res) => {
   // Razorpay at all — Razorpay doesn't support zero-amount orders anyway, and
   // there's nothing to pay for.
   if (amount <= 0) {
-    const pending = { kind, itemId: itemId || null, adDraft: adDraft || null, rewardId, couponId, amount: 0, cartLines };
+    const pending = { kind, itemId: itemId || null, adDraft: adDraft || null, rewardId, couponId, amount: 0, cartLines, freeAdUsed };
     const result = await completeCheckout(pending, req.user.email, null);
     return res.json({ free: true, success: true, ...result });
   }
@@ -1094,7 +1125,7 @@ app.post("/api/checkout/create-order", auth, authLimiter, async (req, res) => {
     });
 
     await db.pendingOrders.insertOne({
-      orderId: order.id, kind, itemId: itemId || null, adDraft: adDraft || null, rewardId, couponId, cartLines,
+      orderId: order.id, kind, itemId: itemId || null, adDraft: adDraft || null, rewardId, couponId, cartLines, freeAdUsed,
       amount, buyerEmail: req.user.email, createdAt: Date.now(),
     });
 
@@ -1135,6 +1166,24 @@ async function completeCheckout(pending, buyerEmail, paymentId) {
     };
     await db.ads.insertOne(ad);
     result = { ad };
+    if (pending.freeAdUsed) {
+      await db.users.updateOne({ email: buyerEmail, freeAdCredits: { $gt: 0 } }, { $inc: { freeAdCredits: -1 } });
+    }
+    // Advertiser refer & earn: the referrer gets one free ad the first time
+    // the advertiser they referred pays for an ad.
+    if (pending.amount > 0 && advertiser.referredBy && !advertiser.referralBonusGranted) {
+      const referrer = await db.users.findOne({ email: advertiser.referredBy });
+      await db.users.updateOne({ id: advertiser.id }, { $set: { referralBonusGranted: true } });
+      if (referrer?.role === "advertiser") {
+        await db.users.updateOne({ email: referrer.email }, {
+          $inc: { freeAdCredits: 1 },
+          $push: { adReferralHistory: { ts: Date.now(), name: sellerDisplayName(advertiser), adHeadline: ad.headline } },
+        });
+        sendPlainEmail(referrer.email, "You've earned a free ad on TestMandi",
+          `<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#1B2A4A"><h2 style="margin:0 0 12px">Your next ad is free!</h2><p style="font-size:14px;line-height:1.6;color:#3B4C72">${String(sellerDisplayName(advertiser)).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))}, who joined with your referral code, just posted their first ad. You've earned one free ad of up to ${FREE_AD_DAYS} days on any placement.</p><p style="font-size:14px;line-height:1.6;color:#3B4C72">Open Ads Studio, create an ad and tick <b>Use my free ad</b> at the last step.</p><p style="text-align:center;margin:24px 0"><a href="${PUBLIC_APP_URL}" style="background:#1B2A4A;color:#FBF7EE;padding:12px 22px;border-radius:6px;text-decoration:none;font-weight:600">Create my free ad</a></p></div>`
+        ).catch(() => {});
+      }
+    }
   } else if (pending.kind === "pass") {
     // All-access pass: extend from the buyer's current expiry if they already
     // have one for this seller (so repeat purchases stack rather than reset),
@@ -1910,6 +1959,8 @@ function inactivityEmailHtml(user) {
   const isSeller = user.role === "seller";
   const body = isSeller
     ? "Your students and sales dashboard are waiting. Log in to check your tests, earnings and payout balance — and refer another seller or student to earn ₹200 each."
+    : user.role === "advertiser"
+    ? "Students are on TestMandi every day. Log in to run your next ad — and refer another business to earn a free ad when they post their first one."
     : "Your tests and progress are waiting. Log in to continue practising — and refer a friend to get 50% off your next test when they buy their first.";
   const link = PUBLIC_APP_URL;
   const apiBase = (process.env.PUBLIC_API_URL || "https://testmandiserver-production.up.railway.app").replace(/\/$/, "");
@@ -1928,7 +1979,7 @@ async function runInactivityReminders() {
   try {
     const cutoff = Date.now() - INACTIVITY_DAYS * 24 * 60 * 60 * 1000;
     const due = await db.users.find({
-      role: { $in: ["buyer", "seller"] },
+      role: { $in: ["buyer", "seller", "advertiser"] },
       emailVerified: { $ne: false },
       reminderEmailsOptOut: { $ne: true },
       lastActiveAt: { $lt: cutoff },
@@ -1950,7 +2001,7 @@ async function startInactivityScheduler() {
     // Existing accounts have no lastActiveAt yet — start their 5-day clock now
     // so nobody gets a surprise blast on first deploy.
     const r = await db.users.updateMany(
-      { role: { $in: ["buyer", "seller"] }, lastActiveAt: { $exists: false } },
+      { role: { $in: ["buyer", "seller", "advertiser"] }, lastActiveAt: { $exists: false } },
       { $set: { lastActiveAt: Date.now() } }
     );
     if (r.modifiedCount) console.log(`Backfilled lastActiveAt for ${r.modifiedCount} user(s).`);
