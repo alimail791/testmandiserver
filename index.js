@@ -10,6 +10,7 @@ import nodemailer from "nodemailer";
 import { initDB, getCollections } from "./db.js";
 import { registerResourceRoutes, registerTestCoverRoutes, ratingBreakdown } from "./resources.js";
 import { registerFollowRoutes } from "./follow.js";
+import { registerBlogRoutes } from "./blog.js";
 
 const mongoDb = await initDB();
 const db = getCollections(mongoDb); // db.users, db.tests, db.meta, etc — real MongoDB collections
@@ -819,6 +820,11 @@ registerResourceRoutes(app, {
   db, auth, requireRole, sellerDisplayName,
   onPublished: (resource) => { followRoutes.notifyFollowers(resource.sellerEmail, { ...resource, kind: "resource" }); },
 });
+
+/* ------------------------------------------------------------------ */
+/* Blog — see blog.js                                                   */
+/* ------------------------------------------------------------------ */
+await registerBlogRoutes(app, { db, auth, requireRole });
 
 /* ------------------------------------------------------------------ */
 /* Follow a seller — see follow.js                                      */
